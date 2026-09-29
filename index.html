@@ -1375,7 +1375,7 @@ function toast(msg, ms = 2400) { const t = $('#toast'); t.textContent = msg; t.c
 const DEFAULT_GAB = 'DCAECEABAABDBDCAACCEBDEEECDBDB'.split('').map(c => LET.indexOf(c));
 const SENS = { rig: { strong: .42, weak: .18 }, nor: { strong: .30, weak: .12 }, sen: { strong: .20, weak: .08 } };
 const S = {
-  cards: [], gab: DEFAULT_GAB.slice(), cfg: { exam: 'ENA 2027', max: 30, sens: 'nor', ocr: 'tesseract' },
+  cards: [], gab: DEFAULT_GAB.slice(), cfg: { exam: 'ENA 2027', max: 30, sens: 'nor', ocr: 'ppocr' },
   tab: 'list', filter: 'all', q: '', openId: null, memOnly: false, gabFrom: 'ENA 2027 — conferir alternativas'
 };
 const thr = () => SENS[S.cfg.sens] || SENS.nor;
@@ -1412,6 +1412,7 @@ function dropUrls(c) { for (const k of ['img', 'thumb']) { const u = URLS.get(c.
 
 /* ================= bibliotecas externas (sob demanda) ================= */
 const LIBS = {
+  onnx: { ok: () => !!window.ort?.InferenceSession, urls: [['https://cdn.jsdelivr.net/npm/onnxruntime-web@1.30.0/dist/ort.min.js']] },
   tesseract: { ok: () => !!window.Tesseract?.createWorker, urls: [['https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/tesseract.min.js']] },
   pdfjs: { ok: () => window.pdfjsLib, urls: [
     ['https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js', 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js'],
@@ -1519,6 +1520,165 @@ function ocrCpf(text) {
   if (candidates.length === 1 && t.replace(/\D/g, '').length === 11) return fmtCpf(candidates[0]);
   return ''; // Nunca inventa/substitui dígitos para fazer o CPF passar na validação.
 }
+
+/* ---------- PP-OCRv6 Small / ONNX Runtime Web ----------
+   Primeiro tenta arquivos locais, ideais para GitHub Pages:
+     ./models/ppocrv6_small_rec.onnx
+     ./models/ppocrv6_dict.txt
+   Se eles não existirem, tenta os espelhos públicos abaixo. Todo o processamento
+   continua sendo feito no navegador; a imagem do cartão não é enviada ao servidor. */
+const PP = { session: null, chars: null, opening: null, unavailable: '', report: null };
+const PP_ASSETS = {
+  model: [
+    './models/ppocrv6_small_rec.onnx',
+    'https://huggingface.co/PaddlePaddle/PP-OCRv6_small_rec_onnx/resolve/main/inference.onnx'
+  ],
+  dict: [
+    './models/ppocrv6_dict.txt',
+    'https://raw.githubusercontent.com/PaddlePaddle/PaddleOCR/main/ppocr/utils/dict/ppocrv6_dict.txt'
+  ]
+};
+function ppStatus(message) { if (PP.report) PP.report(message); }
+async function ppFetchFirst(urls, kind) {
+  let last = null;
+  for (const url of urls) {
+    const ac = new AbortController(), timer = setTimeout(() => ac.abort(), kind === 'modelo' ? 60000 : 20000);
+    try {
+      const r = await fetch(url, { cache: 'force-cache', signal: ac.signal });
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      return kind === 'modelo' ? await r.arrayBuffer() : await r.text();
+    } catch (e) { last = e; console.warn('PP-OCRv6:', url, e.message || e); }
+    finally { clearTimeout(timer); }
+  }
+  throw new Error('Não consegui carregar ' + kind + ' do PP-OCRv6' + (last ? ': ' + (last.message || last) : '.'));
+}
+async function ppOpen() {
+  if (PP.session && PP.chars) return PP;
+  if (PP.unavailable) throw new Error(PP.unavailable);
+  if (PP.opening) return PP.opening;
+  PP.opening = (async () => {
+    ppStatus('Preparando PP-OCRv6 Small — primeiro uso pode baixar ~20 MB…');
+    await ocrDeadline(loadLib('onnx'), 30000, 'Tempo esgotado ao carregar ONNX Runtime Web.');
+    // Uma thread evita depender de COOP/COEP, importante para GitHub Pages e Safari/iOS.
+    ort.env.wasm.numThreads = 1;
+    ort.env.wasm.wasmPaths = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.30.0/dist/';
+    const [model, dictText] = await Promise.all([
+      ppFetchFirst(PP_ASSETS.model, 'modelo'),
+      ppFetchFirst(PP_ASSETS.dict, 'dicionário')
+    ]);
+    let lines = dictText.replace(/\r/g, '').split('\n');
+    while (lines.length && lines[lines.length - 1] === '') lines.pop();
+    // CTCLabelDecode: índice 0 é blank; use_space_char acrescenta espaço no fim.
+    PP.chars = [''];
+    PP.chars.push(...lines);
+    if (!PP.chars.includes(' ')) PP.chars.push(' ');
+    ppStatus('Inicializando PP-OCRv6 Small…');
+    PP.session = await ocrDeadline(ort.InferenceSession.create(model, {
+      executionProviders: ['wasm'], graphOptimizationLevel: 'all'
+    }), 60000, 'Tempo esgotado ao inicializar PP-OCRv6.');
+    return PP;
+  })();
+  try { return await PP.opening; }
+  catch (e) { PP.unavailable = e.message || String(e); PP.opening = null; throw e; }
+}
+function ppAllowed(field, chars) {
+  const out = [0]; // blank CTC
+  for (let i = 1; i < chars.length; i++) {
+    const ch = chars[i];
+    if (field === 'cpf') {
+      if (/^[0-9]$/.test(ch)) out.push(i);
+    } else if (/^[A-Za-zÀ-ÖØ-öø-ÿĀ-ſÇçÑñ.'’\- ]$/u.test(ch)) out.push(i);
+  }
+  return out;
+}
+function ppTensorFromCanvas(source) {
+  const H = 48, W = 320, ratio = source.width / Math.max(1, source.height);
+  const rw = Math.max(1, Math.min(W, Math.ceil(H * ratio)));
+  const cv = document.createElement('canvas'); cv.width = rw; cv.height = H;
+  const cx = cv.getContext('2d', { willReadFrequently: true });
+  cx.fillStyle = 'white'; cx.fillRect(0, 0, rw, H); cx.imageSmoothingEnabled = true; cx.imageSmoothingQuality = 'high';
+  cx.drawImage(source, 0, 0, rw, H);
+  const d = cx.getImageData(0, 0, rw, H).data, x = new Float32Array(3 * H * W);
+  // PaddleOCR usa BGR, CHW, (pixel / 255 - 0.5) / 0.5. O padding permanece 0 (cinza neutro normalizado).
+  for (let y = 0; y < H; y++) for (let xx = 0; xx < rw; xx++) {
+    const p = 4 * (y * rw + xx), dst = y * W + xx;
+    x[dst] = d[p + 2] / 127.5 - 1;               // B
+    x[H * W + dst] = d[p + 1] / 127.5 - 1;       // G
+    x[2 * H * W + dst] = d[p] / 127.5 - 1;       // R
+  }
+  return new ort.Tensor('float32', x, [1, 3, H, W]);
+}
+function ppDecode(output, field, chars) {
+  const dims = output.dims || [], data = output.data;
+  if (!dims.length || !data) throw new Error('Saída inesperada do PP-OCRv6.');
+  let T, C, at;
+  if (dims.length === 3) {
+    // Normalmente [1,T,C]. Também aceita [1,C,T].
+    const target = chars.length;
+    if (Math.abs(dims[2] - target) <= 3 || dims[2] > dims[1]) { T = dims[1]; C = dims[2]; at = (t,c) => data[t*C+c]; }
+    else { C = dims[1]; T = dims[2]; at = (t,c) => data[c*T+t]; }
+  } else if (dims.length === 2) { T = dims[0]; C = dims[1]; at = (t,c) => data[t*C+c]; }
+  else throw new Error('Dimensão inesperada na saída do PP-OCRv6: ' + dims.join('×'));
+  const allowed = ppAllowed(field, chars).filter(i => i < C);
+  if (allowed.length < 2) throw new Error('Dicionário PP-OCRv6 incompatível.');
+  let prev = -1, text = '', sum = 0, n = 0;
+  for (let t = 0; t < T; t++) {
+    let best = 0, bestVal = -Infinity, maxAny = -Infinity, minAny = Infinity;
+    for (const c of allowed) { const v = Number(at(t,c)); if (v > bestVal) { bestVal = v; best = c; } if (v > maxAny) maxAny = v; if (v < minAny) minAny = v; }
+    // Exportações costumam fornecer probabilidades; se vierem logits, estima a probabilidade do vencedor no subconjunto permitido.
+    let prob = bestVal;
+    if (!(prob >= 0 && prob <= 1) || maxAny - minAny > 1.5) {
+      let den = 0; for (const c of allowed) den += Math.exp(Math.min(50, Number(at(t,c)) - bestVal));
+      prob = 1 / Math.max(1e-9, den);
+    }
+    if (best !== 0 && best !== prev && chars[best] !== undefined) { text += chars[best]; sum += Math.max(0, Math.min(1, prob)); n++; }
+    prev = best;
+  }
+  text = field === 'name' ? ocrName(text) : ocrCpf(text);
+  return { text, confidence: n ? (sum / n) * 100 : 0 };
+}
+async function ppocrOCR(header, wantName = true, wantCpf = true, report) {
+  PP.report = report || null;
+  try {
+    const pp = await ppOpen(), candidates = { name: [], cpf: [] };
+    const read = async (field, variant) => {
+      ppStatus('PP-OCRv6: lendo ' + (field === 'name' ? 'nome' : 'CPF') + (variant ? ' — segunda tentativa…' : '…'));
+      const input = ppTensorFromCanvas(ocrField(header, field, variant));
+      const feeds = {}; feeds[pp.session.inputNames[0]] = input;
+      const outputs = await ocrDeadline(pp.session.run(feeds), 30000, 'PP-OCRv6 excedeu o tempo de leitura.');
+      const out = outputs[pp.session.outputNames[0]], dec = ppDecode(out, field, pp.chars);
+      const valid = field === 'name' ? dec.text.split(/\s+/).length >= 2 && dec.text.length >= 5 : cpfValido(dec.text);
+      candidates[field].push({ text: dec.text, confidence: dec.confidence, valid, variant });
+    };
+    if (wantName) { await read('name', 0); if (!candidates.name[0].valid || candidates.name[0].confidence < 86) await read('name', 1); }
+    if (wantCpf) { await read('cpf', 0); if (!candidates.cpf[0].valid || candidates.cpf[0].confidence < 90) await read('cpf', 1); }
+    const pick = field => candidates[field].slice().sort((a,b) => Number(b.valid)-Number(a.valid) || b.confidence-a.confidence)[0] || { text:'',confidence:0,valid:false };
+    const name = pick('name'), cpf = pick('cpf');
+    const different = field => new Set(candidates[field].filter(x => x.text).map(x => x.text)).size > 1;
+    const nameLow = wantName && (!name.valid || name.confidence < 80 || different('name'));
+    const cpfLow = wantCpf && (!cpf.valid || cpf.confidence < 82 || different('cpf'));
+    return { name:name.text, cpf:cpf.text, nameLow, cpfLow, cpfOk:cpf.valid, sure:!nameLow&&!cpfLow, engine:'ppocrv6', candidates, confidence:{name:name.confidence,cpf:cpf.confidence} };
+  } finally { PP.report = null; }
+}
+function ocrScoreCandidate(field, o) {
+  if (!o) return -1e9;
+  const text = o[field] || '', low = field === 'name' ? o.nameLow : o.cpfLow;
+  const valid = field === 'name' ? (text.split(/\s+/).length >= 2 && text.length >= 5) : cpfValido(text);
+  const conf = Number(o.confidence && o.confidence[field]) || 0;
+  return (valid ? 10000 : 0) + (low ? 0 : 1000) + conf;
+}
+function mergeOcr(primary, secondary, wantName, wantCpf) {
+  const out = { ...primary, engine: primary && primary.engine || 'ppocrv6', fallback: secondary || null };
+  if (wantName && ocrScoreCandidate('name', secondary) > ocrScoreCandidate('name', primary)) {
+    out.name = secondary.name; out.nameLow = secondary.nameLow; out.confidence = { ...(out.confidence||{}), name: secondary.confidence?.name || 0 }; out.nameEngine = secondary.engine;
+  } else out.nameEngine = primary?.engine;
+  if (wantCpf && ocrScoreCandidate('cpf', secondary) > ocrScoreCandidate('cpf', primary)) {
+    out.cpf = secondary.cpf; out.cpfLow = secondary.cpfLow; out.cpfOk = secondary.cpfOk; out.confidence = { ...(out.confidence||{}), cpf: secondary.confidence?.cpf || 0 }; out.cpfEngine = secondary.engine;
+  } else out.cpfEngine = primary?.engine;
+  out.sure = !(wantName && out.nameLow) && !(wantCpf && out.cpfLow);
+  if (secondary) out.engine = 'ppocrv6+tesseract';
+  return out;
+}
 async function neuralOCR(header, wantName = true, wantCpf = true, report) {
   const job = async () => {
     OCRE.report = report || null;
@@ -1544,6 +1704,36 @@ async function neuralOCR(header, wantName = true, wantCpf = true, report) {
   };
   const pending = OCRE.queue.then(job, job); OCRE.queue = pending.catch(() => {}); return pending;
 }
+async function selectedOCR(header, wantName = true, wantCpf = true, report) {
+  if (S.cfg.ocr === 'local') {
+    const o = ocrHeader(header.gray, header.w, header.h, 2) || {};
+    return { ...o, nameLow: wantName ? !o.sure : false, cpfLow: wantCpf ? !o.cpfOk : false, engine: 'local', confidence: { name: 0, cpf: 0 } };
+  }
+  if (S.cfg.ocr === 'tesseract') return neuralOCR(header, wantName, wantCpf, report);
+  // PP-OCRv6 é a primeira opção. Tesseract entra apenas se PP falhar ou deixar campo incerto.
+  let primary = null, secondary = null, ppError = null;
+  try { primary = await ppocrOCR(header, wantName, wantCpf, report); }
+  catch (e) { ppError = e; console.warn('PP-OCRv6 indisponível:', e); }
+  const needName = wantName && (!primary || !primary.name || primary.nameLow);
+  const needCpf = wantCpf && (!primary || !primary.cpf || primary.cpfLow || !cpfValido(primary.cpf));
+  if (needName || needCpf) {
+    try {
+      if (report) report(primary ? 'PP-OCRv6 ficou incerto; conferindo com Tesseract…' : 'PP-OCRv6 indisponível; tentando Tesseract…');
+      secondary = await neuralOCR(header, needName, needCpf, report);
+    } catch (e) {
+      console.warn('Tesseract fallback indisponível:', e);
+      if (!primary) throw new Error((ppError ? ppError.message + ' / ' : '') + e.message);
+    }
+  }
+  return secondary ? (primary ? mergeOcr(primary, secondary, wantName, wantCpf) : secondary) : primary;
+}
+function ocrEngineLabel(engine) {
+  if (engine === 'ppocrv6') return 'PP-OCRv6 Small';
+  if (engine === 'ppocrv6+tesseract') return 'PP-OCRv6 + Tesseract';
+  if (engine === 'tesseract') return 'Tesseract.js';
+  if (engine === 'texto') return 'texto do PDF';
+  return 'OCR local';
+}
 async function rereadIdentity(c) {
   if (OCRE.rereading) return;
   OCRE.rereading = true;
@@ -1553,17 +1743,17 @@ async function rereadIdentity(c) {
     let cv = await fileToCanvas(c.ocrCrop || c.img), header;
     if (c.ocrCrop) header = headerFromCanvas(cv);
     else { const d = cv.getContext('2d').getImageData(0, 0, cv.width, cv.height).data; header = warpHeader(d, cv.width, cv.height, [cv.width / CW, 0, 0, 0, cv.height / CH, 0, 0, 0, 1], 2); }
-    const o = await neuralOCR(header, true, true, msg => { if ($('#ocrInfo')) $('#ocrInfo').textContent = msg; });
-    if (!o.name && !o.cpf) throw new Error('O Tesseract não encontrou nome ou CPF. Confira o recorte do cabeçalho.');
+    const o = await selectedOCR(header, true, true, msg => { if ($('#ocrInfo')) $('#ocrInfo').textContent = msg; });
+    if (!o || (!o.name && !o.cpf)) throw new Error('O OCR não encontrou nome ou CPF. Confira o recorte do cabeçalho.');
     if (S.openId !== c.id) return;
-    const msg = `<b>Resultado do Tesseract</b><p>Nome: ${esc(o.name || '(não reconhecido)')}<br>CPF: ${esc(o.cpf || '(não reconhecido)')}</p>${o.nameLow || o.cpfLow ? '<p>Há leitura duvidosa. Confira os dados na imagem.</p>' : ''}<p>Aplicar esses dados? Campos não reconhecidos manterão o valor atual. As respostas e a nota não serão alteradas.</p>`;
+    const msg = `<b>Resultado do ${esc(ocrEngineLabel(o.engine))}</b><p>Nome: ${esc(o.name || '(não reconhecido)')}<br>CPF: ${esc(o.cpf || '(não reconhecido)')}</p>${o.nameLow || o.cpfLow ? '<p>Há leitura duvidosa. Confira os dados na imagem.</p>' : ''}<p>Aplicar esses dados? Campos não reconhecidos manterão o valor atual. As respostas e a nota não serão alteradas.</p>`;
     if (!await ask(msg, 'Aplicar leitura')) return;
     c.ocrPrevious = { name: c.name, cpf: c.cpf, at: Date.now() };
     if (o.name) { c.name = o.name; c.nameSrc = 'ocr'; c.nameLow = o.nameLow; }
     if (o.cpf) { c.cpf = o.cpf; c.cpfLow = o.cpfLow; }
     c.ocrEngine = o.engine; c.ocrDetails = o; c.ocrNotice = ''; c.rev = false;
     await saveCard(c); drawSheet(c); renderList(); toast('Nova leitura aplicada. Confira nome e CPF.');
-  } catch (e) { if ($('#ocrInfo')) $('#ocrInfo').textContent = 'Falha no Tesseract: ' + e.message; toast('Não foi possível reler. Os dados anteriores foram mantidos.', 5000); }
+  } catch (e) { if ($('#ocrInfo')) $('#ocrInfo').textContent = 'Falha no OCR: ' + e.message; toast('Não foi possível reler. Os dados anteriores foram mantidos.', 5000); }
   finally { OCRE.rereading = false; const b = $('[data-sh="ocr"]'); if (b) b.disabled = false; }
 }
 
@@ -1663,8 +1853,8 @@ async function cardFromScan(r, meta) {
   const ocrCrop = await blobOf(headerCanvas(header), 'image/png');
   if (wantName || wantCpf) {
     if (S.cfg.ocr !== 'local') {
-      try { o = await neuralOCR(header, wantName, wantCpf, msg => Busy.set(msg)); ocrEngine = 'tesseract'; }
-      catch (e) { ocrNotice = 'Tesseract indisponível; usado OCR local. Confira nome e CPF.'; }
+      try { o = await selectedOCR(header, wantName, wantCpf, msg => Busy.set(msg)); ocrEngine = o?.engine || S.cfg.ocr; }
+      catch (e) { ocrNotice = (S.cfg.ocr === 'ppocr' ? 'PP-OCRv6/Tesseract indisponíveis' : 'Tesseract indisponível') + '; usado OCR local. Confira nome e CPF.'; }
     }
     if (!o) {
       o = r.ocr; ocrEngine = 'local';
@@ -1906,9 +2096,10 @@ function renderGab() {
     <option value="sen" ${S.cfg.sens === 'sen' ? 'selected' : ''}>Sensível: aceita preenchimento mais leve</option></select>
     <div class="note" style="margin-top:4px">Marcações duvidosas sempre aparecem como alerta para você conferir.</div></div>
   <div class="fld"><label for="cfgOcr">Leitura do nome e CPF</label><select class="txt" id="cfgOcr">
-    <option value="tesseract" ${S.cfg.ocr !== 'local' ? 'selected' : ''}>Tesseract.js — OCR neural</option>
-    <option value="local" ${S.cfg.ocr === 'local' ? 'selected' : ''}>OCR original — sem internet</option></select>
-    <div class="note">Tesseract processa a imagem no aparelho. Precisa de internet para baixar componentes e modelos quando não estiverem disponíveis no navegador; o cache não garante funcionamento offline. PDFs com nome e CPF válidos na camada de texto dispensam OCR. Se o Tesseract falhar, o OCR original é usado com aviso para revisão.</div></div>`;
+    <option value="ppocr" ${S.cfg.ocr === 'ppocr' ? 'selected' : ''}>PP-OCRv6 Small — recomendado</option>
+    <option value="tesseract" ${S.cfg.ocr === 'tesseract' ? 'selected' : ''}>Tesseract.js</option>
+    <option value="local" ${S.cfg.ocr === 'local' ? 'selected' : ''}>OCR original — sem rede</option></select>
+    <div class="note"><b>PP-OCRv6</b> é a primeira opção e roda no próprio aparelho via ONNX Runtime Web. Se a leitura ficar incerta ou o modelo não carregar, o app tenta Tesseract automaticamente; se ambos falharem, usa o OCR local e pede revisão. No GitHub Pages ele tenta primeiro <kbd>models/ppocrv6_small_rec.onnx</kbd> e <kbd>models/ppocrv6_dict.txt</kbd>; se esses arquivos não existirem, usa os modelos públicos pela internet. PDFs com nome e CPF válidos na camada de texto dispensam OCR.</div></div>`;
 }
 function renderExp() {
   const n = S.cards.length, rev = S.cards.filter(needsReview).length;
@@ -1962,8 +2153,8 @@ function drawSheet(c) {
     <div class="row" style="margin-bottom:8px"><button class="btn" data-sh="view">Ver cartão anotado</button></div>
     <div id="alerts"></div>
     ${stripHtml(c)}
-    <div class="row" style="margin:8px 0"><button class="btn" data-sh="ocr">Reler nome/CPF com Tesseract</button></div>
-    <div class="note" id="ocrInfo" role="status">${c.ocrEngine === 'tesseract' ? 'Leitura por Tesseract.js. Confira os dados na imagem.' : c.ocrEngine === 'texto' ? 'Dados extraídos do texto do PDF.' : 'Leitura local anterior. Você pode tentar o Tesseract.'}</div>
+    <div class="row" style="margin:8px 0"><button class="btn" data-sh="ocr">Reler nome/CPF com OCR</button></div>
+    <div class="note" id="ocrInfo" role="status">${c.ocrEngine === 'texto' ? 'Dados extraídos do texto do PDF.' : c.ocrEngine === 'local' ? 'Leitura pelo OCR local. Você pode tentar o OCR neural.' : 'Leitura por ' + esc(ocrEngineLabel(c.ocrEngine)) + '. Confira os dados na imagem.'}</div>
     <div class="fld"><label for="fName">Nome${c.nameSrc === 'ocr' ? ' (lido automaticamente)' : ''}</label><input class="txt" id="fName" autocomplete="off" autocapitalize="characters" value="${esc(c.name)}"></div>
     <div class="fld"><label for="fCpf">CPF</label><input class="txt" id="fCpf" inputmode="numeric" autocomplete="off" value="${esc(fmtCpf(c.cpf))}"><div class="cpfmsg" id="cpfMsg"></div></div>
     <div class="tog"><button class="btn ${c.aus ? 'on' : ''}" data-sh="aus">Ausente</button><button class="btn ${c.eli ? 'on' : ''}" data-sh="eli">Eliminado</button></div>
@@ -2207,7 +2398,7 @@ document.addEventListener('change', async e => {
   }
   else if (t.id === 'cfgExam') { S.cfg.exam = t.value.trim() || 'Prova'; saveKV('cfg', S.cfg); renderHeader(); }
   else if (t.id === 'cfgMax') { S.cfg.max = Math.max(1, parseFloat(t.value) || 30); saveKV('cfg', S.cfg); }
-  else if (t.id === 'cfgOcr') { S.cfg.ocr = t.value; OCRE.unavailable = ''; saveKV('cfg', S.cfg); toast('Motor OCR atualizado para novas leituras'); }
+  else if (t.id === 'cfgOcr') { S.cfg.ocr = t.value; OCRE.unavailable = ''; PP.unavailable = ''; PP.opening = null; saveKV('cfg', S.cfg); toast('Motor OCR atualizado para novas leituras'); }
   else if (t.id === 'cfgSens') { S.cfg.sens = t.value; saveKV('cfg', S.cfg); reclassifyAll(); toast('Leitura recalculada'); }
 });
 
@@ -2219,6 +2410,12 @@ document.addEventListener('change', async e => {
       const kv = await DB.all('kv');
       for (const r of kv) { if (r.k === 'gab' && r.v && r.v.g && r.v.g.length === NQ) { S.gab = r.v.g; S.gabFrom = r.v.from || S.gabFrom; } if (r.k === 'cfg' && r.v) Object.assign(S.cfg, r.v); }
       S.cards = (await DB.all('cards')).sort((a, b) => a.t - b.t);
+      // Migração única: PP-OCRv6 passa a ser a primeira opção para instalações existentes.
+      if (!kv.some(r => r.k === 'ocrPPv6' && r.v === 1)) {
+        if (!S.cfg.ocr || S.cfg.ocr === 'tesseract') S.cfg.ocr = 'ppocr';
+        await DB.put('kv', { k: 'cfg', v: S.cfg });
+        await DB.put('kv', { k: 'ocrPPv6', v: 1 });
+      }
       // Atualização única dos padrões para quem já utilizava a edição anterior.
       if (!kv.some(r => r.k === 'uiEna2027' && r.v === 1)) {
         if (!S.cfg.exam || S.cfg.exam === 'ENA 2026') S.cfg.exam = 'ENA 2027';
