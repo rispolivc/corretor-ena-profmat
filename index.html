@@ -125,6 +125,7 @@ h2{font-size:15px;margin:18px 0 8px}
 .qrow.fl{background:var(--warnbg);margin:0 -14px;padding:8px 14px}
 .qrow .lab{font-size:12px;color:var(--warn);font-weight:700;margin-left:6px}
 .qrow .lab.mut{color:var(--mut)}
+.crop.question-crop{max-width:360px}
 .crop{width:100%;max-width:560px;border:1px solid var(--line);background:#fff;background-repeat:no-repeat;margin:2px 0 6px}
 .tog{display:flex;gap:8px;margin:8px 0}
 .tog button{flex:1}
@@ -926,7 +927,7 @@ function processSource(src, sw, sh, cands, opts) {
 
 /* ---------- leitura das marcações ---------- */
 function readFills(gray, found) {
-  const fills = [], offs = [];
+  const fills = [], offs = [], thresholds = [];
   for (let q = 0; q < NQ; q++) {
     const t = TPL[q]; let dx = 0, dy = 0;
     const f = found && found[q];
@@ -938,7 +939,7 @@ function readFills(gray, found) {
     for (let y = Math.round(rA.y); y < Math.round(rA.y + rA.h); y++)
       for (let x = Math.round(rA.x); x < Math.round(rE.x + rE.w); x++) { hist[gray[y * CW + x]]++; cnt++; }
     let acc = 0, P = 255; for (let i = 255; i >= 0; i--) { acc += hist[i]; if (acc >= cnt * 0.15) { P = i; break; } }
-    const T = Math.max(60, P * 0.62);
+    const T = Math.max(60, P * 0.62); thresholds.push(T);
     const row = [];
     for (let k = 0; k < 5; k++) {
       const r = boxRect(q, k, off);
@@ -949,36 +950,113 @@ function readFills(gray, found) {
     }
     fills.push(row.map(v => Math.round(v * 1000) / 1000));
   }
-  return { fills, offs };
+  return { fills, offs, evidence: strokeEvidence(gray, fills, offs, thresholds) };
 }
+/* Evidência de traços: calibra a moldura pelas alternativas vazias da mesma linha.
+   Assim o interior pode incluir marcas próximas da borda sem contar a própria moldura. */
+function strokeEvidence(gray, fills, offs, thresholds) {
+  const round3 = v => Math.round(v * 1000) / 1000;
+  function edge(r, axis, end, T) {
+    const pos = axis === 0 ? r.x + end * r.w : r.y + end * r.h, candidates = [];
+    for (let p = Math.round(pos) - 6; p <= Math.round(pos) + 6; p++) {
+      let dark = 0, n = 0;
+      const lo = Math.round(axis === 0 ? r.y + 6 : r.x + 8), hi = Math.round(axis === 0 ? r.y + r.h - 6 : r.x + r.w - 8);
+      for (let z = lo; z < hi; z++) { n++; if (gray[axis === 0 ? z * CW + p : p * CW + z] < T) dark++; }
+      candidates.push({ p, v: dark / n });
+    }
+    const max = Math.max(...candidates.map(c => c.v));
+    if (max < .5) return null;
+    const peaks = candidates.filter(c => c.v >= max * .9);
+    return peaks.reduce((s, c) => s + c.p, 0) / peaks.length;
+  }
+  return fills.map((row, q) => {
+    const off = { dx: offs[q][0], dy: offs[q][1] }, boxes = row.map((_, k) => boxRect(q, k, off));
+    const blank = row.map((v, k) => v < .08 ? k : -1).filter(k => k >= 0), T = thresholds?.[q] || 155;
+    const corrections = [[0,0],[0,1],[1,0],[1,1]].map(([axis,end]) => {
+      const points = blank.map(k => {
+        const r = boxes[k], p = edge(r, axis, end, T);
+        return p === null ? null : [k, p - (axis === 0 ? r.x + end * r.w : r.y + end * r.h)];
+      }).filter(Boolean);
+      if (points.length < 2) return row.map(() => 0);
+      const mx = points.reduce((s,p) => s+p[0],0)/points.length, my = points.reduce((s,p) => s+p[1],0)/points.length;
+      const den = points.reduce((s,p) => s+(p[0]-mx)**2,0);
+      const slope = den ? points.reduce((s,p) => s+(p[0]-mx)*(p[1]-my),0)/den : 0;
+      return row.map((_, k) => Math.max(-7, Math.min(7, my+slope*(k-mx))));
+    });
+    return boxes.map((r, k) => {
+      const xa = Math.round(r.x+corrections[0][k]+2.5), xb = Math.round(r.x+r.w+corrections[1][k]-2.5);
+      const ya = Math.round(r.y+corrections[2][k]+2.5), yb = Math.round(r.y+r.h+corrections[3][k]-2.5);
+      const w = Math.max(1,xb-xa), h = Math.max(1,yb-ya), mask = new Uint8Array(w*h);
+      for (let y=0;y<h;y++) for(let x=0;x<w;x++) mask[y*w+x] = gray[(ya+y)*CW+xa+x] < T ? 1 : 0;
+      // Exclui pontos isolados; mantém também traços estreitos e compridos.
+      const parts = _cc(mask,w,h).filter(c => c.a>=12 && c.h>=3 && c.w>=2);
+      return { ink: round3(parts.reduce((s,c)=>s+c.a,0)/(w*h)), largest: Math.max(0,...parts.map(c=>c.a)) };
+    });
+  });
+}
+function hasStroke(e) { return !!e && e.ink >= .025 && e.largest >= 20; }
+function markedAlternative(c, q, k) { return c.fills[q][k] >= thr().weak || hasStroke(c.evidence?.[q]?.[k]); }
+
 /* caixas "Ausente" / "Eliminado" (canto superior) */
 const FLAGBOX = { aus: { x: 65, y: 274, w: 85, h: 49 }, eli: { x: 1085, y: 271, w: 86, h: 48 } };
 function readFlags(gray) {
   const out = {};
   for (const k in FLAGBOX) {
-    const b = FLAGBOX[k]; let dark = 0, n = 0;
-    for (let y = b.y + 10; y < b.y + b.h - 10; y++) for (let x = b.x + 10; x < b.x + b.w - 10; x++) { n++; if (gray[y * CW + x] < 140) dark++; }
-    out[k] = Math.round((dark / n) * 1000) / 1000;
+    const b = FLAGBOX[k];
+    const support = (pos, lo, hi, vertical) => {
+      let dark=0;
+      for(let z=lo;z<hi;z++) {
+        let v=255;
+        for(let d=-1;d<=1;d++) v=Math.min(v,gray[vertical ? z*CW+pos+d : (pos+d)*CW+z]);
+        if(v<210) dark++;
+      }
+      return dark/(hi-lo);
+    };
+    // Procura as duas bordas juntas: uma linha do cabeçalho sozinha não basta.
+    let best=null;
+    for(let y=b.y-22;y<=b.y+22;y++) for(let h=b.h-6;h<=b.h+4;h++) {
+      const a=support(y,b.x+12,b.x+b.w-12,false), z=support(y+h,b.x+12,b.x+b.w-12,false);
+      const score=Math.min(a,z)+.25*(a+z)-.002*(Math.abs(y-b.y)+Math.abs(h-b.h));
+      if(!best||score>best.score) best={y,h,score,confidence:Math.min(a,z)};
+    }
+    let sides=null;
+    for(let x=b.x-20;x<=b.x+20;x++) for(let w=b.w-8;w<=b.w+5;w++) {
+      const a=support(x,best.y+8,best.y+best.h-8,true), z=support(x+w,best.y+8,best.y+best.h-8,true);
+      const score=Math.min(a,z)+.25*(a+z)-.002*(Math.abs(x-b.x)+Math.abs(w-b.w));
+      if(!sides||score>sides.score) sides={x,w,score,confidence:Math.min(a,z)};
+    }
+    let dark=0,n=0;
+    for(let y=best.y+7;y<best.y+best.h-7;y++) for(let x=sides.x+7;x<sides.x+sides.w-7;x++){n++;if(gray[y*CW+x]<140)dark++;}
+    out[k]=Math.round(dark/Math.max(1,n)*1000)/1000;
+    out[k+'Located']=best.confidence>=.55 && sides.confidence>=.55;
   }
   return out;
 }
+function flagDecision(fl, ans) {
+  const answered=ans.some(a=>a>=0||a===-2), marked=fl.aus>.03 && fl.ausLocated;
+  const notices=[];
+  if(marked&&answered) notices.push('Há respostas e uma possível marca em Ausente. Mantido como presente: confira a caixa.');
+  if((fl.aus>.03&&!fl.ausLocated)||(fl.eli>.03&&!fl.eliLocated)) notices.push('Não foi possível confirmar a caixa de situação: confira Ausente/Eliminado.');
+  return {aus:marked&&!answered, eli:fl.eli>.03&&fl.eliLocated, flagNotice:notices.join(' ')};
+}
 /* fills -> {ans[-1 branco | -2 dupla | 0..4], st['ok','blank','double','weak']} */
-function classify(fills, thr) {
-  thr = thr || { strong: 0.30, weak: 0.12 };
-  const ans = [], st = [];
-  for (let q = 0; q < fills.length; q++) {
-    const f = fills[q];
-    const strong = [], weak = [];
-    for (let k = 0; k < 5; k++) { if (f[k] >= thr.strong) strong.push(k); else if (f[k] >= thr.weak) weak.push(k); }
-    if (strong.length >= 2) { ans.push(-2); st.push('double'); }
-    else if (strong.length === 1) {
-      if (weak.length) { ans.push(strong[0]); st.push('weak'); } else { ans.push(strong[0]); st.push('ok'); }
-    } else if (weak.length) {
-      let bk = weak[0]; for (const k of weak) if (f[k] > f[bk]) bk = k;
-      ans.push(bk); st.push('weak');
-    } else { ans.push(-1); st.push('blank'); }
+function classify(fills, thr, evidence) {
+  thr = thr || { strong: .30, weak: .12 };
+  const ans=[],st=[];
+  for(let q=0;q<fills.length;q++) {
+    const f=fills[q], marked=[], faint=[];
+    for(let k=0;k<5;k++) {
+      const e=evidence?.[q]?.[k];
+      if(f[k]>=thr.weak || hasStroke(e)) marked.push(k);
+      else if(e && e.ink>=.012 && e.largest>=12) faint.push(k);
+    }
+    // Uma marca secundária não precisa estar totalmente preenchida para zerar a questão.
+    if(marked.length>=2){ans.push(-2);st.push('double');}
+    else if(marked.length===1){const k=marked[0];ans.push(k);st.push(f[k]>=thr.strong&&!faint.length?'ok':'weak');}
+    else if(faint.length){ans.push(-1);st.push('weak');}
+    else {ans.push(-1);st.push('blank');}
   }
-  return { ans, st };
+  return {ans,st};
 }
 /* Dupla marcação sempre zera a questão, mesmo contendo a alternativa correta. */
 function score(ans, gab, status) {
@@ -1375,7 +1453,7 @@ function toast(msg, ms = 2400) { const t = $('#toast'); t.textContent = msg; t.c
 const DEFAULT_GAB = 'DCAECEABAABDBDCAACCEBDEEECDBDB'.split('').map(c => LET.indexOf(c));
 const SENS = { rig: { strong: .42, weak: .18 }, nor: { strong: .30, weak: .12 }, sen: { strong: .20, weak: .08 } };
 const S = {
-  cards: [], gab: DEFAULT_GAB.slice(), cfg: { exam: 'ENA 2027', max: 30, sens: 'nor', ocr: 'ppocr' },
+  cards: [], gab: DEFAULT_GAB.slice(), cfg: { exam: 'ENA 2027', max: 30, sens: 'nor', ocr: 'tesseract' },
   tab: 'list', filter: 'all', q: '', openId: null, memOnly: false, gabFrom: 'ENA 2027 — conferir alternativas'
 };
 const thr = () => SENS[S.cfg.sens] || SENS.nor;
@@ -1412,8 +1490,7 @@ function dropUrls(c) { for (const k of ['img', 'thumb']) { const u = URLS.get(c.
 
 /* ================= bibliotecas externas (sob demanda) ================= */
 const LIBS = {
-  onnx: { ok: () => !!window.ort?.InferenceSession, urls: [['https://cdn.jsdelivr.net/npm/onnxruntime-web@1.30.0/dist/ort.min.js']] },
-  tesseract: { ok: () => !!window.Tesseract?.createWorker, urls: [['https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/tesseract.min.js']] },
+  tesseract: { ok: () => !!window.Tesseract?.createWorker, urls: [['./tesseract/tesseract.min.js'], ['https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/tesseract.min.js']] },
   pdfjs: { ok: () => window.pdfjsLib, urls: [
     ['https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js', 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js'],
     ['https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/build/pdf.min.js', 'https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/build/pdf.worker.min.js']] },
@@ -1448,27 +1525,37 @@ async function ocrDispose(reason) {
   OCRE.serial++; const w = OCRE.worker; OCRE.worker = null; OCRE.opening = null; OCRE.unavailable = reason || '';
   if (w) try { await w.terminate(); } catch (_) { }
 }
+/* Arquivos do Tesseract. No GitHub Pages, coloque a pasta "tesseract/" ao lado do index.html
+   (tesseract.min.js, worker.min.js, tesseract-core-*.wasm.js e por.traineddata.gz): o app usa
+   esses arquivos e não depende de CDN. Sem a pasta, baixa do jsDelivr no primeiro uso. */
+const TESS_LOCAL = { worker: './tesseract/worker.min.js', core: './tesseract', lang: './tesseract', local: true };
+const TESS_CDN = { worker: 'https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/worker.min.js', core: 'https://cdn.jsdelivr.net/npm/tesseract.js-core@5.1.1', lang: 'https://cdn.jsdelivr.net/npm/@tesseract.js-data/por/4.0.0_best_int', local: false };
+async function tessPaths() {
+  if (/^https?:$/.test(location.protocol)) {
+    try { const r = await fetch(TESS_LOCAL.lang + '/por.traineddata.gz', { method: 'HEAD', cache: 'no-store' }); if (r.ok) return TESS_LOCAL; } catch (_) { }
+  }
+  return TESS_CDN;
+}
 async function ocrWorker() {
   if (OCRE.worker) return OCRE.worker;
   if (OCRE.unavailable) throw new Error(OCRE.unavailable);
-  if (navigator.onLine === false) throw new Error('Sem conexão para carregar o Tesseract.');
   if (OCRE.opening) return OCRE.opening;
   const serial = OCRE.serial;
   OCRE.opening = (async () => {
-    ocrStatus('Preparando Tesseract — o primeiro uso baixa os modelos…');
-    await ocrDeadline(loadLib('tesseract'), 30000, 'Tempo esgotado ao carregar Tesseract.');
+    ocrStatus('Preparando o Tesseract…');
+    const P = await tessPaths();
+    if (!P.local && navigator.onLine === false) throw new Error('Sem conexão para baixar o Tesseract.');
+    await ocrDeadline(loadLib('tesseract'), 30000, 'Tempo esgotado ao carregar o Tesseract.');
     OCRE.fault = new Promise((_, reject) => { OCRE.rejectFault = reject; });
     OCRE.fault.catch(() => {});
-    const pending = Tesseract.createWorker('por+eng', 1, {
-      workerPath: 'https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/worker.min.js',
-      corePath: 'https://cdn.jsdelivr.net/npm/tesseract.js-core@5.1.1',
-      langPath: 'https://tessdata.projectnaptha.com/4.0.0',
-      logger: m => { if (m.status === 'loading language traineddata') ocrStatus('Baixando modelos OCR… ' + Math.round(m.progress * 100) + '%'); },
+    const pending = Tesseract.createWorker('por', 1, {
+      workerPath: P.worker, corePath: P.core, langPath: P.lang, cachePath: 'tess-por-best-int',
+      logger: m => { if (m.status === 'loading language traineddata') ocrStatus('Carregando o modelo de OCR… ' + Math.round(m.progress * 100) + '%'); },
       errorHandler: e => { if (OCRE.rejectFault) OCRE.rejectFault(new Error(String(e.message || e))); }
     }, { load_system_dawg: '0', load_freq_dawg: '0' });
     pending.then(w => { if (serial !== OCRE.serial) w.terminate().catch(() => {}); }).catch(() => {});
-    const w = await ocrDeadline(Promise.race([pending, OCRE.fault]), 90000, 'Tempo esgotado ao baixar/iniciar o OCR.');
-    OCRE.worker = w;
+    const w = await ocrDeadline(Promise.race([pending, OCRE.fault]), 90000, 'Tempo esgotado ao iniciar o OCR.');
+    OCRE.worker = w; OCRE.paths = P;
     return w;
   })();
   try { return await OCRE.opening; } catch (e) { await ocrDispose(e.message); throw e; }
@@ -1512,7 +1599,82 @@ function ocrField(header, field, variant = 0) {
   const ox = out.getContext('2d'); ox.fillStyle = 'white'; ox.fillRect(0, 0, out.width, out.height); ox.imageSmoothingQuality = 'high'; ox.drawImage(raw, x0, y0, x1 - x0, y1 - y0, 16, 16, out.width - 32, out.height - 32);
   return out;
 }
-function ocrName(text) { return text.normalize('NFC').replace(/^\s*NOME\s*:?\s*/i, '').replace(/[^\p{L}\s.'’\-]/gu, ' ').replace(/\s+/g, ' ').trim().toUpperCase(); }
+/* Preparação da linha de texto para o Tesseract:
+   - remove as linhas da moldura pela espessura (finas numa direção e longas na outra);
+   - encontra a linha de texto pelos componentes com altura de letra e descarta sujeira;
+   - no CPF, mantém o grupo "CPF: 000.000.000-00" (o número é extraído pelo formato);
+   - preserva os tons de cinza das letras e ajusta a escala para maiúsculas de ~36 px. */
+const OCR_CAP_PX = 36;
+function _ocrOtsu(g) { const h = new Uint32Array(256); for (let i = 0; i < g.length; i++) h[g[i]]++; let sum = 0; for (let i = 0; i < 256; i++) sum += i * h[i]; let sB = 0, wB = 0, best = 0, t = 128; const n = g.length;
+  for (let i = 0; i < 256; i++) { wB += h[i]; if (!wB) continue; const wF = n - wB; if (!wF) break; sB += i * h[i]; const mB = sB / wB, mF = (sum - sB) / wF, b = wB * wF * (mB - mF) * (mB - mF); if (b > best) { best = b; t = i; } } return t; }
+const _ocrMed = a => { const b = a.slice().sort((x, y) => x - y); return b[b.length >> 1]; };
+function ocrPrepField(header, field, mode = 'gray') {
+  const s = header.w / (HDR.x1 - HDR.x0), range = field === 'name' ? [64, 902] : [860, 1172];
+  const left = Math.max(0, Math.round((range[0] - HDR.x0) * s)), right = Math.min(header.w, Math.round((range[1] - HDR.x0) * s));
+  const w = right - left, h = header.h, g = new Uint8Array(w * h), hist = new Uint32Array(256);
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) { const v = header.gray[y * header.w + left + x]; g[y * w + x] = v; hist[v]++; }
+  const pct = p => { let n = 0; for (let i = 0; i < 256; i++) { n += hist[i]; if (n >= w * h * p) return i; } return 255; };
+  const white = pct(.90), black = Math.min(pct(.01), white - 60);
+  for (let i = 0; i < g.length; i++) g[i] = Math.max(0, Math.min(255, (g[i] - black) * 255 / (white - black)));
+  const t = Math.min(170, Math.max(90, _ocrOtsu(g))), mask = new Uint8Array(w * h);
+  for (let i = 0; i < g.length; i++) mask[i] = g[i] < t ? 1 : 0;
+  // linhas da moldura
+  const hr = new Uint16Array(w * h), vr = new Uint16Array(w * h);
+  for (let y = 0; y < h; y++) { let x = 0; while (x < w) { if (!mask[y * w + x]) { x++; continue; } let e = x; while (e < w && mask[y * w + e]) e++; for (let k = x; k < e; k++) hr[y * w + k] = e - x; x = e; } }
+  for (let x = 0; x < w; x++) { let y = 0; while (y < h) { if (!mask[y * w + x]) { y++; continue; } let e = y; while (e < h && mask[e * w + x]) e++; for (let k = y; k < e; k++) vr[k * w + x] = e - y; y = e; } }
+  const line = new Uint8Array(w * h);
+  for (let i = 0; i < w * h; i++) if (mask[i] && ((hr[i] >= 0.9 * h && vr[i] <= 0.075 * h) || (vr[i] >= 0.45 * h && hr[i] <= 0.075 * h))) { line[i] = 1; mask[i] = 0; }
+  const comps = _cc(mask, w, h), lab = comps.lab;
+  const ch = comps.filter(c => c.h >= 0.12 * h && c.h <= 0.5 * h && c.w <= 25 * c.h && c.a >= 0.12 * c.w * c.h && c.a >= 6 * s * s && c.y0 > 1 && c.y1 < h - 2);
+  if (ch.length < 3) return null;
+  const cap0 = _ocrMed(ch.map(c => c.h)), tall = ch.filter(c => Math.abs(c.h - cap0) <= 0.25 * cap0);
+  const capH = _ocrMed(tall.map(c => c.h)), top = _ocrMed(tall.map(c => c.y0)), bot = _ocrMed(tall.map(c => c.y1));
+  const bandLo = top - 0.3 * capH, bandHi = bot + 0.3 * capH, clip = new Set();
+  let keep = comps.filter(c => {
+    if (c.a < 2 * s * s) return false;
+    if (field === 'name' && c.w >= 0.9 * capH && c.h <= 0.2 * capH) return false;
+    // Só remove fiapos estreitos fora da linha de texto ou junto à margem da moldura.
+    if (c.w <= 0.12 * capH && c.h >= 0.5 * capH && (c.x0 < 4 * s || c.x1 > w - 4 * s || c.y0 < top - .35 * capH || c.y1 > bot + .35 * capH)) return false;
+    if (c.y0 >= top - 0.35 * capH && c.y1 <= bot + 0.35 * capH && c.h <= 1.3 * capH) return true;
+    const ov = Math.min(c.y1, bot) - Math.max(c.y0, top);                  // letra colada numa linha: entra aparada
+    if (ov >= 0.7 * capH && c.h <= 3.2 * capH) { clip.add(c.id); return true; }
+    return false;
+  }).sort((a, b) => a.x0 - b.x0);
+  let use = [];
+  if (field === 'cpf') {
+    const G = []; for (const c of keep) { const W = G[G.length - 1]; if (W && c.x0 - W.x1 <= 1.2 * capH) { W.x1 = Math.max(W.x1, c.x1); W.cs.push(c); } else G.push({ x0: c.x0, x1: c.x1, cs: [c] }); }
+    const tallN = W => W.cs.filter(c => c.h >= 0.7 * capH).length;
+    if (G.length) use = [G.slice().sort((p, q) => tallN(q) - tallN(p))[0]];
+  } else {
+    const words = []; for (const c of keep) { const W = words[words.length - 1]; if (W && c.x0 - W.x1 <= 0.45 * capH) { W.x1 = Math.max(W.x1, c.x1); W.cs.push(c); } else words.push({ x0: c.x0, x1: c.x1, cs: [c] }); }
+    for (const W of words) { if (!W.cs.some(c => c.h >= 0.7 * capH)) continue; if (use.length && W.x0 - use[use.length - 1].x1 > 3.5 * capH) break; use.push(W); }
+  }
+  const ids = new Set(); for (const W of use) for (const c of W.cs) ids.add(c.id);
+  if (!ids.size) return null;
+  const X0 = Math.max(0, Math.min(...use.map(W => W.x0)) - 2), X1 = Math.min(w - 1, Math.max(...use.map(W => W.x1)) + 2);
+  const Y0 = Math.max(0, Math.round(top - 0.45 * capH)), Y1 = Math.min(h - 1, Math.round(bot + 0.45 * capH));
+  const kill = new Uint8Array(w * h);
+  for (let i = 0; i < w * h; i++) if (line[i] || (lab[i] && !ids.has(lab[i]))) kill[i] = 1;
+  const cw = X1 - X0 + 1, chh = Y1 - Y0 + 1, px = new Uint8Array(cw * chh);
+  for (let y = Y0; y <= Y1; y++) for (let x = X0; x <= X1; x++) {
+    const own = ids.has(lab[y * w + x]); let k = false;
+    if (!own) for (let dy = -2; dy <= 2 && !k; dy++) for (let dx = -2; dx <= 2 && !k; dx++) { const yy = y + dy, xx = x + dx; if (yy < 0 || yy >= h || xx < 0 || xx >= w) continue; const j = yy * w + xx; if (kill[j] && !ids.has(lab[j])) k = true; }
+    let v = g[y * w + x]; if (k) v = 255; if ((y < bandLo || y > bandHi) && clip.has(lab[y * w + x])) v = 255;
+    px[(y - Y0) * cw + (x - X0)] = v;
+  }
+  if (mode === 'bin') { const tt = _ocrOtsu(px); for (let i = 0; i < px.length; i++) px[i] = px[i] < tt ? 0 : 255; }
+  const raw = document.createElement('canvas'); raw.width = cw; raw.height = chh;
+  const rx = raw.getContext('2d'), im = rx.createImageData(cw, chh);
+  for (let i = 0; i < px.length; i++) { im.data[4 * i] = im.data[4 * i + 1] = im.data[4 * i + 2] = px[i]; im.data[4 * i + 3] = 255; }
+  rx.putImageData(im, 0, 0);
+  const sc = OCR_CAP_PX / capH, pad = Math.round(0.8 * OCR_CAP_PX), out = document.createElement('canvas');
+  out.width = Math.round(cw * sc) + 2 * pad; out.height = Math.round(chh * sc) + 2 * pad;
+  const ox = out.getContext('2d'); ox.fillStyle = 'white'; ox.fillRect(0, 0, out.width, out.height);
+  ox.imageSmoothingEnabled = true; ox.imageSmoothingQuality = 'high';
+  ox.drawImage(raw, 0, 0, cw, chh, pad, pad, Math.round(cw * sc), Math.round(chh * sc));
+  return out;
+}
+function ocrName(text) { return text.normalize('NFC').replace(/^\s*NOME\s*:?\s*/i, '').replace(/[^\p{L}\s.'’\-]/gu, ' ').replace(/\s+/g, ' ').trim().replace(/^[^\p{L}]+|[^\p{L}]+$/gu, '').toUpperCase(); }
 function ocrCpf(text) {
   const t = text.replace(/.*?CPF\s*:?\s*/i, '').trim();
   const found = t.match(/(?:\d[.\-\s]*){11}/g) || [];
@@ -1521,184 +1683,55 @@ function ocrCpf(text) {
   return ''; // Nunca inventa/substitui dígitos para fazer o CPF passar na validação.
 }
 
-/* ---------- PP-OCRv6 Small / ONNX Runtime Web ----------
-   Primeiro tenta arquivos locais, ideais para GitHub Pages:
-     ./models/ppocrv6_small_rec.onnx
-     ./models/ppocrv6_dict.txt
-   Se eles não existirem, tenta os espelhos públicos abaixo. Todo o processamento
-   continua sendo feito no navegador; a imagem do cartão não é enviada ao servidor. */
-const PP = { session: null, chars: null, opening: null, unavailable: '', report: null };
-const PP_ASSETS = {
-  model: [
-    './models/ppocrv6_small_rec.onnx',
-    'https://huggingface.co/PaddlePaddle/PP-OCRv6_small_rec_onnx/resolve/main/inference.onnx'
-  ],
-  dict: [
-    './models/ppocrv6_dict.txt',
-    'https://raw.githubusercontent.com/PaddlePaddle/PaddleOCR/main/ppocr/utils/dict/ppocrv6_dict.txt'
-  ]
-};
-function ppStatus(message) { if (PP.report) PP.report(message); }
-async function ppFetchFirst(urls, kind) {
-  let last = null;
-  for (const url of urls) {
-    const ac = new AbortController(), timer = setTimeout(() => ac.abort(), kind === 'modelo' ? 60000 : 20000);
-    try {
-      const r = await fetch(url, { cache: 'force-cache', signal: ac.signal });
-      if (!r.ok) throw new Error('HTTP ' + r.status);
-      return kind === 'modelo' ? await r.arrayBuffer() : await r.text();
-    } catch (e) { last = e; console.warn('PP-OCRv6:', url, e.message || e); }
-    finally { clearTimeout(timer); }
+/* Leitura só com Tesseract.
+   Nome: letras, acentos e pontuação de nomes; lido duas vezes (tons de cinza e binarizado). Vai para revisão se as
+   leituras discordarem ou se alguma letra ficar abaixo de 93% de confiança.
+   CPF: "CPF:" + dígitos; o número é extraído pelo formato. Vai para revisão se o dígito
+   verificador falhar ou se a confiança dos dígitos for baixa. Nunca troca dígitos. */
+const OCR_LETTERS = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyzÁÀÂÃÄÉÈÊËÍÌÎÏÓÒÔÕÖÚÙÛÜÇáàâãäéèêëíìîïóòôõöúùûüç .’\'-', OCR_NAME_OK = 93, OCR_CPF_OK = 60;
+function ocrSymbols(data) { const out = []; for (const b of data.blocks || []) for (const p of b.paragraphs || []) for (const l of p.lines || []) for (const w of l.words || []) for (const s of w.symbols || []) if (s.text && s.text.trim()) out.push(s); return out; }
+function ocrParseCpf(sy) {
+  const txt = sy.map(s => s.text).join(''), labeled = /[F:]/.test(txt);
+  let started = !labeled, idx = [];
+  for (let i = 0; i < sy.length; i++) { const c = sy[i].text; if (!started) { if (/[F:]/.test(c)) started = true; continue; } if (/\d/.test(c)) idx.push(i); }
+  if (idx.length > 11) {
+    const after = labeled ? txt.replace(/^.*?[F:]/, '') : txt, m = after.match(/\d{3}\.?\d{3}\.?\d{3}-?\d{2}/);
+    if (m) { const before = after.slice(0, after.indexOf(m[0])).replace(/\D/g, '').length; idx = idx.slice(before, before + 11); } else idx = idx.slice(-11);
   }
-  throw new Error('Não consegui carregar ' + kind + ' do PP-OCRv6' + (last ? ': ' + (last.message || last) : '.'));
-}
-async function ppOpen() {
-  if (PP.session && PP.chars) return PP;
-  if (PP.unavailable) throw new Error(PP.unavailable);
-  if (PP.opening) return PP.opening;
-  PP.opening = (async () => {
-    ppStatus('Preparando PP-OCRv6 Small — primeiro uso pode baixar ~20 MB…');
-    await ocrDeadline(loadLib('onnx'), 30000, 'Tempo esgotado ao carregar ONNX Runtime Web.');
-    // Uma thread evita depender de COOP/COEP, importante para GitHub Pages e Safari/iOS.
-    ort.env.wasm.numThreads = 1;
-    ort.env.wasm.wasmPaths = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.30.0/dist/';
-    const [model, dictText] = await Promise.all([
-      ppFetchFirst(PP_ASSETS.model, 'modelo'),
-      ppFetchFirst(PP_ASSETS.dict, 'dicionário')
-    ]);
-    let lines = dictText.replace(/\r/g, '').split('\n');
-    while (lines.length && lines[lines.length - 1] === '') lines.pop();
-    // CTCLabelDecode: índice 0 é blank; use_space_char acrescenta espaço no fim.
-    PP.chars = [''];
-    PP.chars.push(...lines);
-    if (!PP.chars.includes(' ')) PP.chars.push(' ');
-    ppStatus('Inicializando PP-OCRv6 Small…');
-    PP.session = await ocrDeadline(ort.InferenceSession.create(model, {
-      executionProviders: ['wasm'], graphOptimizationLevel: 'all'
-    }), 60000, 'Tempo esgotado ao inicializar PP-OCRv6.');
-    return PP;
-  })();
-  try { return await PP.opening; }
-  catch (e) { PP.unavailable = e.message || String(e); PP.opening = null; throw e; }
-}
-function ppAllowed(field, chars) {
-  const out = [0]; // blank CTC
-  for (let i = 1; i < chars.length; i++) {
-    const ch = chars[i];
-    if (field === 'cpf') {
-      if (/^[0-9]$/.test(ch)) out.push(i);
-    } else if (/^[A-Za-zÀ-ÖØ-öø-ÿĀ-ſÇçÑñ.'’\- ]$/u.test(ch)) out.push(i);
-  }
-  return out;
-}
-function ppTensorFromCanvas(source) {
-  const H = 48, W = 320, ratio = source.width / Math.max(1, source.height);
-  const rw = Math.max(1, Math.min(W, Math.ceil(H * ratio)));
-  const cv = document.createElement('canvas'); cv.width = rw; cv.height = H;
-  const cx = cv.getContext('2d', { willReadFrequently: true });
-  cx.fillStyle = 'white'; cx.fillRect(0, 0, rw, H); cx.imageSmoothingEnabled = true; cx.imageSmoothingQuality = 'high';
-  cx.drawImage(source, 0, 0, rw, H);
-  const d = cx.getImageData(0, 0, rw, H).data, x = new Float32Array(3 * H * W);
-  // PaddleOCR usa BGR, CHW, (pixel / 255 - 0.5) / 0.5. O padding permanece 0 (cinza neutro normalizado).
-  for (let y = 0; y < H; y++) for (let xx = 0; xx < rw; xx++) {
-    const p = 4 * (y * rw + xx), dst = y * W + xx;
-    x[dst] = d[p + 2] / 127.5 - 1;               // B
-    x[H * W + dst] = d[p + 1] / 127.5 - 1;       // G
-    x[2 * H * W + dst] = d[p] / 127.5 - 1;       // R
-  }
-  return new ort.Tensor('float32', x, [1, 3, H, W]);
-}
-function ppDecode(output, field, chars) {
-  const dims = output.dims || [], data = output.data;
-  if (!dims.length || !data) throw new Error('Saída inesperada do PP-OCRv6.');
-  let T, C, at;
-  if (dims.length === 3) {
-    // Normalmente [1,T,C]. Também aceita [1,C,T].
-    const target = chars.length;
-    if (Math.abs(dims[2] - target) <= 3 || dims[2] > dims[1]) { T = dims[1]; C = dims[2]; at = (t,c) => data[t*C+c]; }
-    else { C = dims[1]; T = dims[2]; at = (t,c) => data[c*T+t]; }
-  } else if (dims.length === 2) { T = dims[0]; C = dims[1]; at = (t,c) => data[t*C+c]; }
-  else throw new Error('Dimensão inesperada na saída do PP-OCRv6: ' + dims.join('×'));
-  const allowed = ppAllowed(field, chars).filter(i => i < C);
-  if (allowed.length < 2) throw new Error('Dicionário PP-OCRv6 incompatível.');
-  let prev = -1, text = '', sum = 0, n = 0;
-  for (let t = 0; t < T; t++) {
-    let best = 0, bestVal = -Infinity, maxAny = -Infinity, minAny = Infinity;
-    for (const c of allowed) { const v = Number(at(t,c)); if (v > bestVal) { bestVal = v; best = c; } if (v > maxAny) maxAny = v; if (v < minAny) minAny = v; }
-    // Exportações costumam fornecer probabilidades; se vierem logits, estima a probabilidade do vencedor no subconjunto permitido.
-    let prob = bestVal;
-    if (!(prob >= 0 && prob <= 1) || maxAny - minAny > 1.5) {
-      let den = 0; for (const c of allowed) den += Math.exp(Math.min(50, Number(at(t,c)) - bestVal));
-      prob = 1 / Math.max(1e-9, den);
-    }
-    if (best !== 0 && best !== prev && chars[best] !== undefined) { text += chars[best]; sum += Math.max(0, Math.min(1, prob)); n++; }
-    prev = best;
-  }
-  text = field === 'name' ? ocrName(text) : ocrCpf(text);
-  return { text, confidence: n ? (sum / n) * 100 : 0 };
-}
-async function ppocrOCR(header, wantName = true, wantCpf = true, report) {
-  PP.report = report || null;
-  try {
-    const pp = await ppOpen(), candidates = { name: [], cpf: [] };
-    const read = async (field, variant) => {
-      ppStatus('PP-OCRv6: lendo ' + (field === 'name' ? 'nome' : 'CPF') + (variant ? ' — segunda tentativa…' : '…'));
-      const input = ppTensorFromCanvas(ocrField(header, field, variant));
-      const feeds = {}; feeds[pp.session.inputNames[0]] = input;
-      const outputs = await ocrDeadline(pp.session.run(feeds), 30000, 'PP-OCRv6 excedeu o tempo de leitura.');
-      const out = outputs[pp.session.outputNames[0]], dec = ppDecode(out, field, pp.chars);
-      const valid = field === 'name' ? dec.text.split(/\s+/).length >= 2 && dec.text.length >= 5 : cpfValido(dec.text);
-      candidates[field].push({ text: dec.text, confidence: dec.confidence, valid, variant });
-    };
-    if (wantName) { await read('name', 0); if (!candidates.name[0].valid || candidates.name[0].confidence < 86) await read('name', 1); }
-    if (wantCpf) { await read('cpf', 0); if (!candidates.cpf[0].valid || candidates.cpf[0].confidence < 90) await read('cpf', 1); }
-    const pick = field => candidates[field].slice().sort((a,b) => Number(b.valid)-Number(a.valid) || b.confidence-a.confidence)[0] || { text:'',confidence:0,valid:false };
-    const name = pick('name'), cpf = pick('cpf');
-    const different = field => new Set(candidates[field].filter(x => x.text).map(x => x.text)).size > 1;
-    const nameLow = wantName && (!name.valid || name.confidence < 80 || different('name'));
-    const cpfLow = wantCpf && (!cpf.valid || cpf.confidence < 82 || different('cpf'));
-    return { name:name.text, cpf:cpf.text, nameLow, cpfLow, cpfOk:cpf.valid, sure:!nameLow&&!cpfLow, engine:'ppocrv6', candidates, confidence:{name:name.confidence,cpf:cpf.confidence} };
-  } finally { PP.report = null; }
-}
-function ocrScoreCandidate(field, o) {
-  if (!o) return -1e9;
-  const text = o[field] || '', low = field === 'name' ? o.nameLow : o.cpfLow;
-  const valid = field === 'name' ? (text.split(/\s+/).length >= 2 && text.length >= 5) : cpfValido(text);
-  const conf = Number(o.confidence && o.confidence[field]) || 0;
-  return (valid ? 10000 : 0) + (low ? 0 : 1000) + conf;
-}
-function mergeOcr(primary, secondary, wantName, wantCpf) {
-  const out = { ...primary, engine: primary && primary.engine || 'ppocrv6', fallback: secondary || null };
-  if (wantName && ocrScoreCandidate('name', secondary) > ocrScoreCandidate('name', primary)) {
-    out.name = secondary.name; out.nameLow = secondary.nameLow; out.confidence = { ...(out.confidence||{}), name: secondary.confidence?.name || 0 }; out.nameEngine = secondary.engine;
-  } else out.nameEngine = primary?.engine;
-  if (wantCpf && ocrScoreCandidate('cpf', secondary) > ocrScoreCandidate('cpf', primary)) {
-    out.cpf = secondary.cpf; out.cpfLow = secondary.cpfLow; out.cpfOk = secondary.cpfOk; out.confidence = { ...(out.confidence||{}), cpf: secondary.confidence?.cpf || 0 }; out.cpfEngine = secondary.engine;
-  } else out.cpfEngine = primary?.engine;
-  out.sure = !(wantName && out.nameLow) && !(wantCpf && out.cpfLow);
-  if (secondary) out.engine = 'ppocrv6+tesseract';
-  return out;
+  const digits = idx.map(i => sy[i].text).join(''), cs = idx.map(i => sy[i].confidence).sort((a, b) => a - b);
+  const mean = cs.length ? cs.reduce((a, b) => a + b, 0) / cs.length : 0;
+  // o 1º dígito, colado aos dois-pontos, costuma vir com confiança baixa mesmo certo: usa o 2º menor valor e a média
+  return { digits, valid: digits.length === 11 && cpfValido(digits), conf: cs.length > 1 ? Math.min(cs[1], mean) : 0 };
 }
 async function neuralOCR(header, wantName = true, wantCpf = true, report) {
   const job = async () => {
     OCRE.report = report || null;
     try {
       const worker = await ocrWorker(), candidates = { name: [], cpf: [] };
-      const read = async (field, variant) => {
-        ocrStatus('Lendo ' + (field === 'name' ? 'nome' : 'CPF') + (variant ? ' — segunda tentativa…' : '…'));
-        await ocrDeadline(Promise.race([worker.setParameters({ tessedit_pageseg_mode: '7', preserve_interword_spaces: '1', user_defined_dpi: '300', tessedit_char_whitelist: field === 'cpf' && variant ? '0123456789.- ' : '' }), OCRE.fault]), 15000, 'OCR não respondeu.');
-        const { data } = await ocrDeadline(Promise.race([worker.recognize(ocrField(header, field, variant)), OCRE.fault]), 45000, 'A leitura OCR excedeu o tempo limite.');
-        const text = field === 'name' ? ocrName(data.text || '') : ocrCpf(data.text || '');
-        const valid = field === 'name' ? text.split(/\s+/).length >= 2 && text.length >= 5 : cpfValido(text);
-        candidates[field].push({ text, confidence: Number(data.confidence) || 0, valid, raw: data.text || '', variant });
+      const read = async (field, mode) => {
+        ocrStatus('Lendo ' + (field === 'name' ? 'nome' : 'CPF') + (mode === 'bin' ? ' — conferência…' : '…'));
+        const img = ocrPrepField(header, field, mode) || ocrField(header, field, mode === 'bin' ? 1 : 0);
+        await ocrDeadline(Promise.race([worker.setParameters({ tessedit_pageseg_mode: '7', preserve_interword_spaces: '1', user_defined_dpi: '300', lstm_choice_mode: '2', tessedit_char_whitelist: field === 'cpf' ? 'CPF:0123456789.-' : OCR_LETTERS }), OCRE.fault]), 15000, 'OCR não respondeu.');
+        const { data } = await ocrDeadline(Promise.race([worker.recognize(img, {}, { text: true, blocks: true }), OCRE.fault]), 45000, 'A leitura OCR excedeu o tempo limite.');
+        const sy = ocrSymbols(data);
+        let r;
+        if (field === 'name') {
+          const text = ocrName(data.text || ''), letters = sy.filter(s => /\p{L}/u.test(s.text));
+          r = { text, valid: text.split(' ').length >= 2 && text.length >= 5, confidence: letters.length ? Math.min(...letters.map(s => s.confidence)) : 0 };
+        } else {
+          const p = ocrParseCpf(sy);
+          r = { text: p.digits.length === 11 ? fmtCpf(p.digits) : '', digits: p.digits, valid: p.valid, confidence: p.conf };
+        }
+        r.mode = mode; r.raw = data.text || ''; candidates[field].push(r); return r;
       };
-      if (wantName) { await read('name', 0); if (!candidates.name[0].valid || candidates.name[0].confidence < 88) await read('name', 1); }
-      if (wantCpf) { await read('cpf', 0); await read('cpf', 1); }
-      const pick = field => candidates[field].slice().sort((a, b) => Number(b.valid) - Number(a.valid) || b.confidence - a.confidence)[0] || { text: '', confidence: 0, valid: false };
+      const pick = f => candidates[f].slice().sort((a, b) => Number(b.valid) - Number(a.valid) || b.confidence - a.confidence)[0] || { text: '', valid: false, confidence: 0 };
+      const differ = f => { const v = candidates[f].filter(x => x.text); return v.length > 1 && new Set(v.map(x => x.text)).size > 1; };
+      let nameLow = false, cpfLow = false;
+      if (wantName) { await read('name', 'gray'); await read('name', 'bin'); }
+      if (wantCpf) { const a = await read('cpf', 'gray'); if (!a.valid || a.confidence < OCR_CPF_OK) await read('cpf', 'bin'); }
       const name = pick('name'), cpf = pick('cpf');
-      const different = field => new Set(candidates[field].filter(x => x.text).map(x => x.text)).size > 1;
-      const nameLow = wantName && (!name.valid || name.confidence < 85 || different('name'));
-      const cpfLow = wantCpf && (!cpf.valid || cpf.confidence < 80 || different('cpf'));
+      if (wantName) nameLow = !name.valid || name.confidence < OCR_NAME_OK || differ('name');
+      if (wantCpf) cpfLow = !cpf.valid || cpf.confidence < OCR_CPF_OK || (differ('cpf') && candidates.cpf.every(x => x.valid));
       return { name: name.text, cpf: cpf.text, nameLow, cpfLow, cpfOk: cpf.valid, sure: !nameLow && !cpfLow, engine: 'tesseract', candidates, confidence: { name: name.confidence, cpf: cpf.confidence } };
     } catch (e) { await ocrDispose(e.message); throw e; } finally { OCRE.report = null; }
   };
@@ -1709,29 +1742,12 @@ async function selectedOCR(header, wantName = true, wantCpf = true, report) {
     const o = ocrHeader(header.gray, header.w, header.h, 2) || {};
     return { ...o, nameLow: wantName ? !o.sure : false, cpfLow: wantCpf ? !o.cpfOk : false, engine: 'local', confidence: { name: 0, cpf: 0 } };
   }
-  if (S.cfg.ocr === 'tesseract') return neuralOCR(header, wantName, wantCpf, report);
-  // PP-OCRv6 é a primeira opção. Tesseract entra apenas se PP falhar ou deixar campo incerto.
-  let primary = null, secondary = null, ppError = null;
-  try { primary = await ppocrOCR(header, wantName, wantCpf, report); }
-  catch (e) { ppError = e; console.warn('PP-OCRv6 indisponível:', e); }
-  const needName = wantName && (!primary || !primary.name || primary.nameLow);
-  const needCpf = wantCpf && (!primary || !primary.cpf || primary.cpfLow || !cpfValido(primary.cpf));
-  if (needName || needCpf) {
-    try {
-      if (report) report(primary ? 'PP-OCRv6 ficou incerto; conferindo com Tesseract…' : 'PP-OCRv6 indisponível; tentando Tesseract…');
-      secondary = await neuralOCR(header, needName, needCpf, report);
-    } catch (e) {
-      console.warn('Tesseract fallback indisponível:', e);
-      if (!primary) throw new Error((ppError ? ppError.message + ' / ' : '') + e.message);
-    }
-  }
-  return secondary ? (primary ? mergeOcr(primary, secondary, wantName, wantCpf) : secondary) : primary;
+  return neuralOCR(header, wantName, wantCpf, report);
 }
 function ocrEngineLabel(engine) {
-  if (engine === 'ppocrv6') return 'PP-OCRv6 Small';
-  if (engine === 'ppocrv6+tesseract') return 'PP-OCRv6 + Tesseract';
   if (engine === 'tesseract') return 'Tesseract.js';
   if (engine === 'texto') return 'texto do PDF';
+  if (engine === 'ensemble3' || engine === 'ppocrv6' || engine === 'parseq' || engine === 'ppocrv6+tesseract') return 'OCR da versão anterior';
   return 'OCR local';
 }
 async function rereadIdentity(c) {
@@ -1746,7 +1762,7 @@ async function rereadIdentity(c) {
     const o = await selectedOCR(header, true, true, msg => { if ($('#ocrInfo')) $('#ocrInfo').textContent = msg; });
     if (!o || (!o.name && !o.cpf)) throw new Error('O OCR não encontrou nome ou CPF. Confira o recorte do cabeçalho.');
     if (S.openId !== c.id) return;
-    const msg = `<b>Resultado do ${esc(ocrEngineLabel(o.engine))}</b><p>Nome: ${esc(o.name || '(não reconhecido)')}<br>CPF: ${esc(o.cpf || '(não reconhecido)')}</p>${o.nameLow || o.cpfLow ? '<p>Há leitura duvidosa. Confira os dados na imagem.</p>' : ''}<p>Aplicar esses dados? Campos não reconhecidos manterão o valor atual. As respostas e a nota não serão alteradas.</p>`;
+    const msg = `<b>Resultado do ${esc(ocrEngineLabel(o.engine))}</b><p>Nome: ${esc(o.name || '(não reconhecido)')}<br>CPF: ${esc(o.cpf || '(não reconhecido)')}</p>${o.nameLow || o.cpfLow ? '<p><b>Leitura com dúvida em pelo menos um campo.</b> Confira os dados na imagem.</p>' : ''}<p>Aplicar esses dados? Campos não reconhecidos manterão o valor atual. As respostas e a nota não serão alteradas.</p>`;
     if (!await ask(msg, 'Aplicar leitura')) return;
     c.ocrPrevious = { name: c.name, cpf: c.cpf, at: Date.now() };
     if (o.name) { c.name = o.name; c.nameSrc = 'ocr'; c.nameLow = o.nameLow; }
@@ -1755,6 +1771,29 @@ async function rereadIdentity(c) {
     await saveCard(c); drawSheet(c); renderList(); toast('Nova leitura aplicada. Confira nome e CPF.');
   } catch (e) { if ($('#ocrInfo')) $('#ocrInfo').textContent = 'Falha no OCR: ' + e.message; toast('Não foi possível reler. Os dados anteriores foram mantidos.', 5000); }
   finally { OCRE.rereading = false; const b = $('[data-sh="ocr"]'); if (b) b.disabled = false; }
+}
+
+async function rereadMarks(c) {
+  if (S.rereadingMarks) return;
+  S.rereadingMarks = true;
+  const button = $('[data-sh="marks"]'); if (button) button.disabled = true;
+  try {
+    const cv = await fileToCanvas(c.img), canonical = document.createElement('canvas');
+    canonical.width = CW; canonical.height = CH;
+    canonical.getContext('2d').drawImage(cv,0,0,CW,CH);
+    const gray = headerFromCanvas(canonical).gray, found = findMarkers(gray,CW,CH,1).found;
+    const rf = readFills(gray,found), cl = classify(rf.fills,thr(),rf.evidence), fl = readFlags(gray);
+    if (S.openId !== c.id) return;
+    c.fills=rf.fills; c.offs=rf.offs; c.evidence=rf.evidence; c.flagRead=fl; c.detectionVersion=2;
+    for(let q=0;q<NQ;q++) if(!c.man[q]) {c.ans[q]=cl.ans[q];c.st[q]=cl.st[q];}
+    const situation=flagDecision(fl,c.ans);
+    for(const k of ['aus','eli']) if(!c.flagManual?.[k]) c[k]=situation[k];
+    c.flagNotice=c.flagManual?.aus&&c.flagManual?.eli?'':situation.flagNotice;
+    c.rev=false;
+    await saveCard(c); drawSheet(c); renderList();
+    toast('Marcações e situação relidas. Confira os alertas.');
+  } catch(e) { toast('Não foi possível reler a foto salva: '+e.message,5000); }
+  finally { S.rereadingMarks=false; const b=$('[data-sh="marks"]'); if(b)b.disabled=false; }
 }
 
 /* ================= caixas de diálogo ================= */
@@ -1782,11 +1821,12 @@ function alertsOf(c) {
   const d = c.ans.map((_, i) => isDouble(c, i) ? i + 1 : 0).filter(Boolean);
   const w = c.st.map((s, i) => s === 'weak' ? i + 1 : 0).filter(Boolean);
   if (d.length) a.push('Dupla marcação — questão zerada: ' + d.map(n => 'Q' + n).join(', '));
-  if (w.length) a.push('Marcação fraca: ' + w.map(n => 'Q' + n).join(', '));
+  if (w.length) a.push('Marcação fraca ou traço suspeito: ' + w.map(n => 'Q' + n).join(', '));
   if (!c.name) a.push('Sem nome');
   else if (c.nameSrc === 'ocr' && c.nameLow) a.push('Nome lido por OCR com dúvida: confira');
   if (c.cpfLow) a.push('Leitura do CPF com dúvida: confira na imagem');
   if (c.ocrNotice) a.push(c.ocrNotice);
+  if (c.flagNotice) a.push(c.flagNotice);
   if (!cpfValido(c.cpf)) a.push(c.cpf ? 'CPF inválido' : 'Sem CPF');
   return a;
 }
@@ -1794,12 +1834,12 @@ const needsReview = c => !c.rev && alertsOf(c).length > 0;
 function dupOf(c) { const d = (c.cpf || '').replace(/\D/g, ''); if (d.length !== 11) return null; return S.cards.find(o => o.id !== c.id && (o.cpf || '').replace(/\D/g, '') === d) || null; }
 function reclassifyAll() {
   for (const c of S.cards) {
-    const cl = classify(c.fills, thr());
+    const cl = classify(c.fills, thr(), c.evidence);
     for (let q = 0; q < NQ; q++) if (!c.man[q]) { c.ans[q] = cl.ans[q]; c.st[q] = cl.st[q]; }
     saveCard(c);
   }
 }
-function sortedCards() { return S.cards.slice().sort((a, b) => (a.name || '\uffff').localeCompare(b.name || '\uffff', 'pt-BR') || a.t - b.t); }
+function sortedCards() { return S.cards.slice().sort((a, b) => a.t - b.t); }
 function visibleCards() {
   const q = S.q.trim().toLowerCase(), qd = q.replace(/\D/g, '');
   return S.cards.filter(c => {
@@ -1808,7 +1848,7 @@ function visibleCards() {
     if (S.filter === 'aus' && !(c.aus || c.eli)) return false;
     if (q && !((c.name || '').toLowerCase().includes(q) || (qd && (c.cpf || '').replace(/\D/g, '').includes(qd)))) return false;
     return true;
-  }).sort((a, b) => b.t - a.t);
+  }).sort((a, b) => a.t - b.t);
 }
 
 /* ================= leitura de imagens ================= */
@@ -1844,7 +1884,7 @@ async function cardFromScan(r, meta) {
   const th = document.createElement('canvas'); th.width = 180; th.height = Math.round(180 * CH / CW);
   th.getContext('2d').drawImage(cv, 0, 0, th.width, th.height);
   const thumb = await blobOf(th, 'image/jpeg', 0.7);
-  const rf = readFills(r.gray, r.found), cl = classify(rf.fills, thr()), fl = readFlags(r.gray);
+  const rf = readFills(r.gray, r.found), cl = classify(rf.fills, thr(), rf.evidence), fl = readFlags(r.gray), situation = flagDecision(fl, cl.ans);
   /* nome e CPF: camada de texto do PDF (se houver) e, senão, leitura por OCR */
   let name = meta.name || '', cpf = meta.cpf || '', nameSrc = name ? 'texto' : '', nameLow = false, cpfLow = false;
   let o = null, ocrEngine = 'texto', ocrNotice = '';
@@ -1854,7 +1894,7 @@ async function cardFromScan(r, meta) {
   if (wantName || wantCpf) {
     if (S.cfg.ocr !== 'local') {
       try { o = await selectedOCR(header, wantName, wantCpf, msg => Busy.set(msg)); ocrEngine = o?.engine || S.cfg.ocr; }
-      catch (e) { ocrNotice = (S.cfg.ocr === 'ppocr' ? 'PP-OCRv6/Tesseract indisponíveis' : 'Tesseract indisponível') + '; usado OCR local. Confira nome e CPF.'; }
+      catch (e) { const lab = 'O Tesseract não pôde ser usado (' + e.message + ')'; ocrNotice = lab + '; usado OCR local. Confira nome e CPF.'; }
     }
     if (!o) {
       o = r.ocr; ocrEngine = 'local';
@@ -1867,8 +1907,8 @@ async function cardFromScan(r, meta) {
   }
   return {
     id: uid(), t: Date.now(), src: meta.src, file: meta.file || '', page: meta.page || 0,
-    name, cpf, nameSrc, nameLow, cpfLow, ocrCrop, ocrEngine, ocrNotice, ocrDetails: o, fills: rf.fills, offs: rf.offs, ans: cl.ans, st: cl.st,
-    man: new Array(NQ).fill(false), aus: fl.aus > 0.03, eli: fl.eli > 0.03, rev: false, img, thumb, inl: r.inliers
+    name, cpf, nameSrc, nameLow, cpfLow, ocrCrop, ocrEngine, ocrNotice, ocrDetails: o, fills: rf.fills, offs: rf.offs, evidence: rf.evidence, flagRead: fl, detectionVersion: 2, ans: cl.ans, st: cl.st,
+    man: new Array(NQ).fill(false), ...situation, flagManual: {}, rev: false, img, thumb, inl: r.inliers
   };
 }
 async function fileToCanvas(file, maxSide = 2600) {
@@ -1892,7 +1932,7 @@ function nameCpfFromItems(items) {
     const row = its.filter(i => Math.abs(i.y - ci.y) < 6 && i.x < ci.x - 1 && !/^CPF:?$/i.test(i.s)).sort((a, b) => a.x - b.x);
     name = row.map(r => r.s).join(' ').replace(/CPF:?/i, '').replace(/\s+/g, ' ').trim();
   }
-  if (name && !/^[A-ZÀ-ÖØ-Ý' .\-]{4,}$/.test(name)) name = name.toUpperCase().replace(/[^A-ZÀ-ÖØ-Ý' .\-]/g, '').trim();
+  name = ocrName(name);
   return { name, cpf: cpf.length === 11 ? fmtCpf(cpf) : '' };
 }
 
@@ -1970,7 +2010,7 @@ async function annotate(c, scale = 1) {
     const gr = boxRect(q, 5, off), cx = gr.x + gr.w / 2, cy = gr.y + gr.h / 2;
     x.lineWidth = 4;
     if (a >= 0 && !double) { const r = boxRect(q, a, off); x.strokeStyle = ok ? OKC : BADC; x.strokeRect(r.x - 2, r.y - 2, r.w + 4, r.h + 4); }
-    if (double) { x.strokeStyle = WARNC; for (let k = 0; k < 5; k++) if (c.fills[q][k] >= T.strong) { const r = boxRect(q, k, off); x.strokeRect(r.x - 2, r.y - 2, r.w + 4, r.h + 4); } }
+    if (double) { x.strokeStyle = WARNC; for (let k = 0; k < 5; k++) if (markedAlternative(c, q, k)) { const r = boxRect(q, k, off); x.strokeRect(r.x - 2, r.y - 2, r.w + 4, r.h + 4); } }
     if (gk < 5 && !ok && !double) { const r = boxRect(q, gk, off); x.setLineDash([7, 5]); x.lineWidth = 3; x.strokeStyle = OKC; x.strokeRect(r.x - 2, r.y - 2, r.w + 4, r.h + 4); x.setLineDash([]); }
     x.lineWidth = 4.5; x.font = '700 22px system-ui, sans-serif'; x.textBaseline = 'middle'; x.textAlign = 'left';
     if (double) { x.fillStyle = WARNC; x.textAlign = 'center'; x.font = '800 23px system-ui,sans-serif'; x.fillText('0', cx, cy + 1); }
@@ -2096,10 +2136,9 @@ function renderGab() {
     <option value="sen" ${S.cfg.sens === 'sen' ? 'selected' : ''}>Sensível: aceita preenchimento mais leve</option></select>
     <div class="note" style="margin-top:4px">Marcações duvidosas sempre aparecem como alerta para você conferir.</div></div>
   <div class="fld"><label for="cfgOcr">Leitura do nome e CPF</label><select class="txt" id="cfgOcr">
-    <option value="ppocr" ${S.cfg.ocr === 'ppocr' ? 'selected' : ''}>PP-OCRv6 Small — recomendado</option>
-    <option value="tesseract" ${S.cfg.ocr === 'tesseract' ? 'selected' : ''}>Tesseract.js</option>
-    <option value="local" ${S.cfg.ocr === 'local' ? 'selected' : ''}>OCR original — sem rede</option></select>
-    <div class="note"><b>PP-OCRv6</b> é a primeira opção e roda no próprio aparelho via ONNX Runtime Web. Se a leitura ficar incerta ou o modelo não carregar, o app tenta Tesseract automaticamente; se ambos falharem, usa o OCR local e pede revisão. No GitHub Pages ele tenta primeiro <kbd>models/ppocrv6_small_rec.onnx</kbd> e <kbd>models/ppocrv6_dict.txt</kbd>; se esses arquivos não existirem, usa os modelos públicos pela internet. PDFs com nome e CPF válidos na camada de texto dispensam OCR.</div></div>`;
+    <option value="tesseract" ${S.cfg.ocr !== 'local' ? 'selected' : ''}>Tesseract.js — recomendado</option>
+    <option value="local" ${S.cfg.ocr === 'local' ? 'selected' : ''}>OCR original — reserva, sem baixar nada</option></select>
+    <div class="note">O Tesseract lê nome (com acentos) e CPF no próprio navegador; a imagem não sai do aparelho. Nome e CPF com qualquer dúvida vão para "Revisar". No GitHub Pages, coloque a pasta <kbd>tesseract/</kbd> ao lado do <kbd>index.html</kbd> para não depender de CDN.</div></div>`;
 }
 function renderExp() {
   const n = S.cards.length, rev = S.cards.filter(needsReview).length;
@@ -2116,17 +2155,17 @@ function renderExp() {
 /* ---------- revisão ---------- */
 function rowHtml(c, q) {
   const st = c.st[q], a = c.ans[q], g = S.gab[q], double = isDouble(c, q), fl = double || st === 'weak';
-  const lab = double ? 'dupla marcação — zerada (0)' : st === 'weak' ? 'marcação fraca' : st === 'blank' ? 'em branco' : (c.man[q] ? 'ajustada' : '');
+  const lab = double ? 'dupla marcação — zerada (0)' : st === 'weak' ? 'marcação fraca / traço suspeito' : st === 'blank' ? 'em branco' : (c.man[q] ? 'ajustada' : '');
   const chips = [0, 1, 2, 3, 4].map(k => {
     let cl = 'chip';
-    if (double) { if (c.fills[q][k] >= thr().strong) cl += ' dbl'; }
+    if (double) { if (markedAlternative(c, q, k)) cl += ' dbl'; }
     else if (a === k) cl += (g === 5 || g === k) ? ' ok' : ' bad';
     else if (g === k && a !== k) cl += ' key';
     return `<button class="${cl}" data-set="${q},${k}" aria-label="Questão ${q + 1} alternativa ${LET[k]}">${LET[k]}</button>`;
   }).join('');
   const off = c.offs ? c.offs[q] : [0, 0], t = TPL[q], cropX = t.x - 12 + off[0], cropW = 470, cropY = t.y - 8 + off[1], cropH = 41;
   const px = Math.max(0, Math.min(1, cropX / (CW - cropW))) * 100, py = Math.max(0, Math.min(1, cropY / (CH - cropH))) * 100;
-  const crop = fl ? `<div class="crop" style="aspect-ratio:${cropW}/${cropH};background-image:url(${urlOf(c, 'img')});background-size:${CW / cropW * 100}% auto;background-position:${px}% ${py}%"></div>` : '';
+  const crop = fl ? `<div class="crop question-crop" style="aspect-ratio:${cropW}/${cropH};background-image:url(${urlOf(c, 'img')});background-size:${CW / cropW * 100}% auto;background-position:${px}% ${py}%"></div>` : '';
   return `<div class="qrow ${fl ? 'fl' : ''}" id="q${q}">${crop}<div class="qr" style="border:0;padding:0"><span class="qn">${q + 1}</span>${chips}<span class="lab ${fl ? '' : 'mut'}">${lab}</span></div></div>`;
 }
 function openSheet(id, opts) {
@@ -2154,11 +2193,13 @@ function drawSheet(c) {
     <div id="alerts"></div>
     ${stripHtml(c)}
     <div class="row" style="margin:8px 0"><button class="btn" data-sh="ocr">Reler nome/CPF com OCR</button></div>
-    <div class="note" id="ocrInfo" role="status">${c.ocrEngine === 'texto' ? 'Dados extraídos do texto do PDF.' : c.ocrEngine === 'local' ? 'Leitura pelo OCR local. Você pode tentar o OCR neural.' : 'Leitura por ' + esc(ocrEngineLabel(c.ocrEngine)) + '. Confira os dados na imagem.'}</div>
+    <div class="note" id="ocrInfo" role="status">${c.ocrEngine === 'texto' ? 'Dados extraídos do texto do PDF.' : c.ocrEngine === 'local' ? 'Leitura pelo OCR local. Você pode reler com o Tesseract.' : 'Leitura por ' + esc(ocrEngineLabel(c.ocrEngine)) + '. ' + (c.nameLow || c.cpfLow ? 'Há dúvida em algum campo: confira na imagem.' : 'Confira os dados na imagem.')}</div>
     <div class="fld"><label for="fName">Nome${c.nameSrc === 'ocr' ? ' (lido automaticamente)' : ''}</label><input class="txt" id="fName" autocomplete="off" autocapitalize="characters" value="${esc(c.name)}"></div>
     <div class="fld"><label for="fCpf">CPF</label><input class="txt" id="fCpf" inputmode="numeric" autocomplete="off" value="${esc(fmtCpf(c.cpf))}"><div class="cpfmsg" id="cpfMsg"></div></div>
     <div class="tog"><button class="btn ${c.aus ? 'on' : ''}" data-sh="aus">Ausente</button><button class="btn ${c.eli ? 'on' : ''}" data-sh="eli">Eliminado</button></div>
     <h2>Respostas</h2>
+    <div class="row"><button class="btn" data-sh="marks">Reler marcações e situação</button></div>
+    <div class="note" style="margin:6px 0 10px">Atualiza a leitura da foto salva e mantém respostas ajustadas manualmente.</div>
     <div class="row"><button class="fchip ${S.onlyAlerts ? 'on' : ''}" data-sh="only">${S.onlyAlerts ? 'Mostrando só alertas' : 'Mostrar só alertas'}</button></div>
     <div id="qlist">${Array.from({ length: NQ }, (_, q) => rowHtml(c, q)).join('')}</div>
   </div></div></div>
@@ -2212,8 +2253,9 @@ async function sheetAction(a) {
   if (a === 'close') return closeSheet();
   if (a === 'view') return showViewer(c);
   if (a === 'ocr') return rereadIdentity(c);
+  if (a === 'marks') return rereadMarks(c);
   if (a === 'only') { S.onlyAlerts = !S.onlyAlerts; const b = $('[data-sh="only"]'); b.classList.toggle('on', S.onlyAlerts); b.textContent = S.onlyAlerts ? 'Mostrando só alertas' : 'Mostrar só alertas'; return applyOnly(); }
-  if (a === 'aus' || a === 'eli') { c[a] = !c[a]; $(`[data-sh="${a}"]`).classList.toggle('on', c[a]); saveSoon(c); refreshMeta(c); return pvSoon(c); }
+  if (a === 'aus' || a === 'eli') { c[a] = !c[a]; c.flagManual = { ...c.flagManual, [a]: true }; c.flagNotice = ''; $(`[data-sh="${a}"]`).classList.toggle('on', c[a]); saveSoon(c); refreshMeta(c); return pvSoon(c); }
   if (a === 'prev' || a === 'next') { await saveCard(c); const n = ids[pos + (a === 'next' ? 1 : -1)]; if (n) { S.openId = n; drawSheet(S.cards.find(x => x.id === n)); $('#sheet .ovbody').scrollTop = 0; } return; }
   if (a === 'okrev') {
     c.rev = !c.rev; await saveCard(c);
@@ -2398,7 +2440,7 @@ document.addEventListener('change', async e => {
   }
   else if (t.id === 'cfgExam') { S.cfg.exam = t.value.trim() || 'Prova'; saveKV('cfg', S.cfg); renderHeader(); }
   else if (t.id === 'cfgMax') { S.cfg.max = Math.max(1, parseFloat(t.value) || 30); saveKV('cfg', S.cfg); }
-  else if (t.id === 'cfgOcr') { S.cfg.ocr = t.value; OCRE.unavailable = ''; PP.unavailable = ''; PP.opening = null; saveKV('cfg', S.cfg); toast('Motor OCR atualizado para novas leituras'); }
+  else if (t.id === 'cfgOcr') { S.cfg.ocr = t.value; OCRE.unavailable = ''; saveKV('cfg', S.cfg); toast('Motor OCR atualizado para novas leituras'); }
   else if (t.id === 'cfgSens') { S.cfg.sens = t.value; saveKV('cfg', S.cfg); reclassifyAll(); toast('Leitura recalculada'); }
 });
 
@@ -2410,12 +2452,8 @@ document.addEventListener('change', async e => {
       const kv = await DB.all('kv');
       for (const r of kv) { if (r.k === 'gab' && r.v && r.v.g && r.v.g.length === NQ) { S.gab = r.v.g; S.gabFrom = r.v.from || S.gabFrom; } if (r.k === 'cfg' && r.v) Object.assign(S.cfg, r.v); }
       S.cards = (await DB.all('cards')).sort((a, b) => a.t - b.t);
-      // Migração única: PP-OCRv6 passa a ser a primeira opção para instalações existentes.
-      if (!kv.some(r => r.k === 'ocrPPv6' && r.v === 1)) {
-        if (!S.cfg.ocr || S.cfg.ocr === 'tesseract') S.cfg.ocr = 'ppocr';
-        await DB.put('kv', { k: 'cfg', v: S.cfg });
-        await DB.put('kv', { k: 'ocrPPv6', v: 1 });
-      }
+      // A votação entre OCRs foi removida: qualquer escolha antiga (consenso, PP-OCR, PARSeq) vira Tesseract.
+      if (S.cfg.ocr !== 'local' && S.cfg.ocr !== 'tesseract') { S.cfg.ocr = 'tesseract'; await DB.put('kv', { k: 'cfg', v: S.cfg }); }
       // Atualização única dos padrões para quem já utilizava a edição anterior.
       if (!kv.some(r => r.k === 'uiEna2027' && r.v === 1)) {
         if (!S.cfg.exam || S.cfg.exam === 'ENA 2026') S.cfg.exam = 'ENA 2027';
