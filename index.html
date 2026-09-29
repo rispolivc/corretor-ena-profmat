@@ -7,19 +7,19 @@
 <style>
 :root{
   --bg:#e8ecf1; --surf:#ffffff; --surf2:#f3f5f8; --ink:#141c26; --mut:#5a6776; --line:#ccd4dd;
-  --pen:#2340c4; --pen-ink:#ffffff; --ok:#0d7a52; --okbg:#dcf3e8; --bad:#c62828; --badbg:#fbe1e1; --warn:#a85f00; --warnbg:#fdeccb;
+  --pen:#2340c4; --pen-ink:#ffffff; --ok:#2563eb; --okbg:#dbeafe; --bad:#c62828; --badbg:#fbe1e1; --warn:#a85f00; --warnbg:#fdeccb;
   --grid:rgba(35,64,196,.06);
   box-sizing:border-box; padding-top:env(safe-area-inset-top,0px); padding-bottom:env(safe-area-inset-bottom,0px);
 }
 @media (prefers-color-scheme:dark){
   :root:not([data-theme="light"]){
     --bg:#10161d; --surf:#18212b; --surf2:#1f2a36; --ink:#e8edf3; --mut:#9aa8b8; --line:#2c3a48;
-    --pen:#7c93ff; --pen-ink:#0d1220; --ok:#4cd39b; --okbg:#12382b; --bad:#ff7b7b; --badbg:#421c1c; --warn:#f2b45a; --warnbg:#3f2d0f; --grid:rgba(124,147,255,.07);
+    --pen:#7c93ff; --pen-ink:#0d1220; --ok:#60a5fa; --okbg:#172554; --bad:#ff7b7b; --badbg:#421c1c; --warn:#f2b45a; --warnbg:#3f2d0f; --grid:rgba(124,147,255,.07);
   }
 }
 :root[data-theme="dark"]{
   --bg:#10161d; --surf:#18212b; --surf2:#1f2a36; --ink:#e8edf3; --mut:#9aa8b8; --line:#2c3a48;
-  --pen:#7c93ff; --pen-ink:#0d1220; --ok:#4cd39b; --okbg:#12382b; --bad:#ff7b7b; --badbg:#421c1c; --warn:#f2b45a; --warnbg:#3f2d0f; --grid:rgba(124,147,255,.07);
+  --pen:#7c93ff; --pen-ink:#0d1220; --ok:#60a5fa; --okbg:#172554; --bad:#ff7b7b; --badbg:#421c1c; --warn:#f2b45a; --warnbg:#3f2d0f; --grid:rgba(124,147,255,.07);
 }
 *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
 html{height:100%;scroll-padding-top:env(safe-area-inset-top,0px)}
@@ -1771,7 +1771,7 @@ async function annotate(c, scale = 1) {
   const bmp = await createImageBitmap(c.img);
   const cv = document.createElement('canvas'); cv.width = Math.round(CW * scale); cv.height = Math.round(CH * scale);
   const x = cv.getContext('2d'); x.scale(scale, scale); x.drawImage(bmp, 0, 0, CW, CH); if (bmp.close) bmp.close();
-  const OKC = '#0d8a5a', BADC = '#d32f2f', WARNC = '#d98200', BLUE = '#2340c4';
+  const OKC = '#2563eb', BADC = '#d32f2f', WARNC = '#d98200', BLUE = '#2340c4';
   const T = thr();
   x.lineJoin = 'round'; x.lineCap = 'round';
   for (let q = 0; q < NQ; q++) {
@@ -1916,7 +1916,7 @@ function renderExp() {
   <div class="note">${n} cartão(ões) gravados${rev ? ` · <b>${rev}</b> ainda com alerta de revisão` : ''}. Você pode exportar a qualquer momento com o que já foi corrigido.</div>
   <div class="row" style="flex-direction:column;align-items:stretch;margin:12px 0"><button class="btn pri" data-act="xlsx">Planilha (.xlsx): nome, CPF, acertos, nota, respostas</button>
   <button class="btn" data-act="pdfx">PDF com todos os cartões anotados</button></div>
-  <div class="note">No PDF, cada página é o cartão do aluno com ✓ verde nos acertos, ✗ vermelho nos erros (a resposta certa aparece ao lado), 0 laranja nas questões zeradas por dupla marcação e o total no campo "Total de acertos na prova".</div>
+  <div class="note">No PDF, cada página é o cartão do aluno com ✓ azul nos acertos, ✗ vermelho nos erros (a resposta certa aparece ao lado), 0 laranja nas questões zeradas por dupla marcação e o total no campo "Total de acertos na prova".</div>
   <h2>Dados neste aparelho</h2>
   <div class="note">Os cartões, fotos e notas ficam só neste navegador (nada é enviado a servidor). Se limpar os dados do navegador, eles somem, então exporte antes.</div>
   <div class="row" style="margin-top:10px"><button class="btn dng" data-act="wipe">Apagar todos os cartões</button></div>`;
@@ -2119,7 +2119,7 @@ function camAnalyze() {
   CAM.lock = { H: ok.H, k };
   if (!CAM.armed) { camDraw(corners, 'rgba(120,150,255,1)', 0, aw, ah, k); camHud('Cartão lido. Retire-o e coloque o próximo', 'A foto automática volta quando o quadro esvaziar'); return; }
   const sharp = fm >= 0.85 * CAM.maxFocus;
-  camDraw(corners, 'rgba(40,200,120,1)', Math.min(1, CAM.stable / 6), aw, ah, k);
+  camDraw(corners, 'rgba(37,99,235,1)', Math.min(1, CAM.stable / 6), aw, ah, k);
   camHud('Cartão reconhecido', CAM.stable >= 6 && !sharp ? 'Ajustando o foco…' : 'Segure firme, a foto sai sozinha');
   if ((CAM.stable >= 6 && sharp) || CAM.stable >= 16) camCapture(true);
 }
