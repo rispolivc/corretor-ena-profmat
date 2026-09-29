@@ -28,7 +28,10 @@ button,input,select{font:inherit;color:inherit}
 button{cursor:pointer}
 #app{height:100%;display:flex;flex-direction:column;max-width:1100px;margin:0 auto;background:
   linear-gradient(var(--grid) 1px,transparent 1px) 0 0/24px 24px,linear-gradient(90deg,var(--grid) 1px,transparent 1px) 0 0/24px 24px,var(--bg)}
-.top{display:flex;align-items:baseline;justify-content:space-between;gap:12px;padding:12px 16px 8px}
+.top{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:12px 16px 8px}
+.top .brand{display:flex;align-items:center;gap:12px;min-width:0}
+.profmat-logo{width:60px;height:65px;object-fit:contain;background:#fff;border-radius:6px;padding:3px;flex-shrink:0}
+@media(max-width:420px){.top{padding:10px 12px 8px}.top .brand{gap:10px}.profmat-logo{width:48px;height:52px}.top h1{font-size:18px}}
 .top h1{margin:0;font-size:19px;font-weight:750;letter-spacing:-.01em}
 .top .exam{color:var(--mut);font-size:13px}
 .pers{font-size:12px;color:var(--mut)}
@@ -44,6 +47,7 @@ main{flex:1;min-height:0;position:relative}
 .btn.pri{background:var(--pen);border-color:var(--pen);color:var(--pen-ink)}
 .btn.dng{color:var(--bad);border-color:var(--bad)}
 .btn:disabled{opacity:.5}
+@media(max-width:520px){.list-actions [data-act="pdf"]{flex-basis:100%}.list-actions .btn:not([data-act="pdf"]){flex:1}}
 .row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
 .grow{flex:1}
 .sum{display:flex;gap:18px;flex-wrap:wrap;margin:6px 0 10px}
@@ -141,8 +145,8 @@ kbd{font:inherit;font-weight:700}
 <body>
 <div id="app">
   <header class="top">
-    <div><h1>Corretor de cartões</h1><div class="exam" id="examName"></div></div>
-    <div class="pers" id="pers"></div>
+    <div class="brand"><img class="profmat-logo" src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAMAAAADQCAYAAABRCm6cAAAAGXRFWHRTb2Z0d2FyZQBBZG9iZSBJbWFnZVJlYWR5ccllPAAABFFpVFh0WE1MOmNvbS5hZG9iZS54bXAAAAAAADw/eHBhY2tldCBiZWdpbj0i77u/IiBpZD0iVzVNME1wQ2VoaUh6cmVTek5UY3prYzlkIj8+IDx4OnhtcG1ldGEgeG1sbnM6eD0iYWRvYmU6bnM6bWV0YS8iIHg6eG1wdGs9IkFkb2JlIFhNUCBDb3JlIDkuMS1jMDAxIDc5LmE4ZDQ3NTM0OSwgMjAyMy8wMy8yMy0xMzowNTo0NSAgICAgICAgIj4gPHJkZjpSREYgeG1sbnM6cmRmPSJodHRwOi8vd3d3LnczLm9yZy8xOTk5LzAyLzIyLXJkZi1zeW50YXgtbnMjIj4gPHJkZjpEZXNjcmlwdGlvbiByZGY6YWJvdXQ9IiIgeG1sbnM6eG1wTU09Imh0dHA6Ly9ucy5hZG9iZS5jb20veGFwLzEuMC9tbS8iIHhtbG5zOnN0UmVmPSJodHRwOi8vbnMuYWRvYmUuY29tL3hhcC8xLjAvc1R5cGUvUmVzb3VyY2VSZWYjIiB4bWxuczp4bXA9Imh0dHA6Ly9ucy5hZG9iZS5jb20veGFwLzEuMC8iIHhtbG5zOmRjPSJodHRwOi8vcHVybC5vcmcvZGMvZWxlbWVudHMvMS4xLyIgeG1wTU06T3JpZ2luYWxEb2N1bWVudElEPSJ1dWlkOjNmZTUyY2I4LWNiNTEtNDVhYy04NDhlLTJlZDRmNzA5Yzk0YSIgeG1wTU06RG9jdW1lbnRJRD0ieG1wLmRpZDpGOUQ3N0EwN0Q1RkYxMUYwQjgwN0E4MkQ3RUM3RDY2MyIgeG1wTU06SW5zdGFuY2VJRD0ieG1wLmlpZDpGOUQ3N0EwNkQ1RkYxMUYwQjgwN0E4MkQ3RUM3RDY2MyIgeG1wOkNyZWF0b3JUb29sPSJBY3JvYmF0IFBERk1ha2VyIDI0IHBhcmEgUG93ZXJQb2ludCI+IDx4bXBNTTpEZXJpdmVkRnJvbSBzdFJlZjppbnN0YW5jZUlEPSJ4bXAuaWlkOjA5ODI3MjE2MEYwMzExRjA4NTQ5REU5MEQ1RkY2QjcyIiBzdFJlZjpkb2N1bWVudElEPSJ4bXAu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" alt="PROFMAT"><div><h1>Corretor de cartões</h1><div class="exam" id="examName"></div></div></div>
+    <div class="pers bad" id="pers" hidden></div>
   </header>
   <main>
     <section class="view on" id="v-list"></section>
@@ -976,10 +980,13 @@ function classify(fills, thr) {
   }
   return { ans, st };
 }
-/* pontuação: gab[q] em 0..4 ou 5 (anulada = ponto para todos) */
-function score(ans, gab) {
+/* Dupla marcação sempre zera a questão, mesmo contendo a alternativa correta. */
+function score(ans, gab, status) {
   let s = 0;
-  for (let q = 0; q < NQ; q++) if (gab[q] === 5 || (ans[q] >= 0 && ans[q] === gab[q])) s++;
+  for (let q = 0; q < NQ; q++) {
+    if (ans[q] === -2 || (status && status[q] === 'double')) continue;
+    if (gab[q] === 5 || (ans[q] >= 0 && ans[q] === gab[q])) s++;
+  }
   return s;
 }
 function cpfValido(c) {
@@ -1368,8 +1375,8 @@ function toast(msg, ms = 2400) { const t = $('#toast'); t.textContent = msg; t.c
 const DEFAULT_GAB = 'DCAECEABAABDBDCAACCEBDEEECDBDB'.split('').map(c => LET.indexOf(c));
 const SENS = { rig: { strong: .42, weak: .18 }, nor: { strong: .30, weak: .12 }, sen: { strong: .20, weak: .08 } };
 const S = {
-  cards: [], gab: DEFAULT_GAB.slice(), cfg: { exam: 'ENA 2026', max: 10, sens: 'nor', ocr: 'tesseract' },
-  tab: 'list', filter: 'all', q: '', openId: null, memOnly: false, gabFrom: 'ENA 2026 (PDF enviado)'
+  cards: [], gab: DEFAULT_GAB.slice(), cfg: { exam: 'ENA 2027', max: 30, sens: 'nor', ocr: 'tesseract' },
+  tab: 'list', filter: 'all', q: '', openId: null, memOnly: false, gabFrom: 'ENA 2027 — conferir alternativas'
 };
 const thr = () => SENS[S.cfg.sens] || SENS.nor;
 
@@ -1578,12 +1585,13 @@ const Busy = {
 };
 
 /* ================= regras do cartão ================= */
-const cardScore = c => score(c.ans, S.gab);
+const isDouble = (c, q) => c.ans[q] === -2 || c.st[q] === 'double';
+const cardScore = c => score(c.ans, S.gab, c.st);
 function alertsOf(c) {
   const a = [];
-  const d = c.st.map((s, i) => s === 'double' ? i + 1 : 0).filter(Boolean);
+  const d = c.ans.map((_, i) => isDouble(c, i) ? i + 1 : 0).filter(Boolean);
   const w = c.st.map((s, i) => s === 'weak' ? i + 1 : 0).filter(Boolean);
-  if (d.length) a.push('Dupla marcação: ' + d.map(n => 'Q' + n).join(', '));
+  if (d.length) a.push('Dupla marcação — questão zerada: ' + d.map(n => 'Q' + n).join(', '));
   if (w.length) a.push('Marcação fraca: ' + w.map(n => 'Q' + n).join(', '));
   if (!c.name) a.push('Sem nome');
   else if (c.nameSrc === 'ocr' && c.nameLow) a.push('Nome lido por OCR com dúvida: confira');
@@ -1768,14 +1776,15 @@ async function annotate(c, scale = 1) {
   x.lineJoin = 'round'; x.lineCap = 'round';
   for (let q = 0; q < NQ; q++) {
     const off = { dx: c.offs ? c.offs[q][0] : 0, dy: c.offs ? c.offs[q][1] : 0 };
-    const a = c.ans[q], gk = S.gab[q], ok = gk === 5 || (a >= 0 && a === gk);
+    const a = c.ans[q], gk = S.gab[q], double = isDouble(c, q), ok = !double && (gk === 5 || (a >= 0 && a === gk));
     const gr = boxRect(q, 5, off), cx = gr.x + gr.w / 2, cy = gr.y + gr.h / 2;
     x.lineWidth = 4;
-    if (a >= 0) { const r = boxRect(q, a, off); x.strokeStyle = ok ? OKC : BADC; x.strokeRect(r.x - 2, r.y - 2, r.w + 4, r.h + 4); }
-    if (a === -2) { x.strokeStyle = WARNC; for (let k = 0; k < 5; k++) if (c.fills[q][k] >= T.strong) { const r = boxRect(q, k, off); x.strokeRect(r.x - 2, r.y - 2, r.w + 4, r.h + 4); } }
-    if (gk < 5 && !ok) { const r = boxRect(q, gk, off); x.setLineDash([7, 5]); x.lineWidth = 3; x.strokeStyle = OKC; x.strokeRect(r.x - 2, r.y - 2, r.w + 4, r.h + 4); x.setLineDash([]); }
+    if (a >= 0 && !double) { const r = boxRect(q, a, off); x.strokeStyle = ok ? OKC : BADC; x.strokeRect(r.x - 2, r.y - 2, r.w + 4, r.h + 4); }
+    if (double) { x.strokeStyle = WARNC; for (let k = 0; k < 5; k++) if (c.fills[q][k] >= T.strong) { const r = boxRect(q, k, off); x.strokeRect(r.x - 2, r.y - 2, r.w + 4, r.h + 4); } }
+    if (gk < 5 && !ok && !double) { const r = boxRect(q, gk, off); x.setLineDash([7, 5]); x.lineWidth = 3; x.strokeStyle = OKC; x.strokeRect(r.x - 2, r.y - 2, r.w + 4, r.h + 4); x.setLineDash([]); }
     x.lineWidth = 4.5; x.font = '700 22px system-ui, sans-serif'; x.textBaseline = 'middle'; x.textAlign = 'left';
-    if (gk === 5) { x.fillStyle = BLUE; x.textAlign = 'center'; x.font = '700 16px system-ui,sans-serif'; x.fillText('anul.', cx, cy + 1); }
+    if (double) { x.fillStyle = WARNC; x.textAlign = 'center'; x.font = '800 23px system-ui,sans-serif'; x.fillText('0', cx, cy + 1); }
+    else if (gk === 5) { x.fillStyle = BLUE; x.textAlign = 'center'; x.font = '700 16px system-ui,sans-serif'; x.fillText('anul.', cx, cy + 1); }
     else if (ok) { x.strokeStyle = OKC; x.beginPath(); x.moveTo(cx - 9, cy); x.lineTo(cx - 2, cy + 8); x.lineTo(cx + 10, cy - 8); x.stroke(); }
     else {
       const col = a >= 0 ? BADC : WARNC; x.strokeStyle = col; x.fillStyle = col;
@@ -1820,10 +1829,10 @@ async function exportXlsx() {
     const sc = cardScore(c);
     rows.push([c.name || '', c.cpf || '', c.aus ? '' : sc, c.aus ? '' : Math.round(sc / NQ * S.cfg.max * 100) / 100,
       c.aus ? 'Ausente' : c.eli ? 'Eliminado' : 'Presente', c.rev ? 'Revisado' : (alertsOf(c).length ? 'Pendente' : 'Sem alertas'), alertsOf(c).join(' | ')]
-      .concat(c.ans.map(a => a >= 0 ? LET[a] : a === -2 ? 'DUPLA' : '')));
+      .concat(c.ans.map((a, q) => isDouble(c, q) ? 'DUPLA (0)' : a >= 0 ? LET[a] : '')));
   }
   const ws = XLSX.utils.aoa_to_sheet(rows);
-  ws['!cols'] = [{ wch: 38 }, { wch: 16 }, { wch: 9 }, { wch: 8 }, { wch: 11 }, { wch: 12 }, { wch: 36 }].concat(Array(NQ).fill({ wch: 6 }));
+  ws['!cols'] = [{ wch: 38 }, { wch: 16 }, { wch: 9 }, { wch: 8 }, { wch: 11 }, { wch: 12 }, { wch: 36 }].concat(Array(NQ).fill({ wch: 12 }));
   for (let r = 1; r < rows.length; r++) { const cell = ws[XLSX.utils.encode_cell({ r, c: 3 })]; if (cell && typeof cell.v === 'number') cell.z = '0.00'; }
   const g = [['Questão', 'Resposta']].concat(S.gab.map((k, i) => [i + 1, k === 5 ? 'ANULADA' : LET[k]]));
   const wg = XLSX.utils.aoa_to_sheet(g); wg['!cols'] = [{ wch: 9 }, { wch: 10 }];
@@ -1855,14 +1864,14 @@ async function exportPdf() {
 function renderHeader() {
   $('#examName').textContent = S.cfg.exam || '';
   const p = $('#pers');
-  p.className = 'pers' + (S.memOnly ? ' bad' : '');
-  p.textContent = S.memOnly ? 'Sem gravação no aparelho' : (S.persist ? 'Salvo neste aparelho' : 'Salvo neste navegador');
+  p.hidden = !S.memOnly;
+  p.textContent = S.memOnly ? 'Sem gravação no aparelho' : '';
 }
 function renderList() {
   const el = $('#v-list'), all = S.cards, vis = visibleCards();
   const rev = all.filter(needsReview).length, sc = all.filter(c => !c.aus).map(cardScore);
   const avg = sc.length ? sc.reduce((a, b) => a + b, 0) / sc.length : 0;
-  let h = `<div class="row" style="margin:6px 0 4px"><button class="btn pri grow" data-act="pdf">Carregar PDF de cartões</button><button class="btn" data-act="img">Fotos</button></div>`;
+  let h = `<div class="row list-actions" style="margin:6px 0 4px"><button class="btn pri grow" data-act="pdf">Carregar PDF de cartões</button><button class="btn" data-act="img">Fotos</button><button class="btn dng" data-act="wipe" ${all.length ? '' : 'disabled'}>Apagar tudo</button></div>`;
   if (!all.length) {
     h += `<div class="empty"><b>Nenhum cartão corrigido ainda</b>Carregue um PDF com os cartões digitalizados ou abra a aba Câmera. Tudo fica gravado neste aparelho, então você pode corrigir aos poucos.</div>`;
   } else {
@@ -1885,7 +1894,7 @@ function renderGab() {
   for (let q = 0; q < NQ; q++) {
     rows += `<div class="qr"><span class="qn">${q + 1}</span>${[0, 1, 2, 3, 4].map(k => `<button class="chip ${S.gab[q] === k ? 'sel' : ''}" data-g="${q},${k}">${LET[k]}</button>`).join('')}<button class="chip an ${S.gab[q] === 5 ? 'sel' : ''}" data-g="${q},5">Anulada</button></div>`;
   }
-  el.innerHTML = `<h2 style="margin-top:8px">Gabarito</h2><div class="note">Origem: ${esc(S.gabFrom)}. Toque numa letra para alterar. "Anulada" dá o ponto a todos. Mudar aqui recalcula todas as notas.</div>
+  el.innerHTML = `<h2 style="margin-top:8px">Gabarito</h2><div class="note">Referência: ${esc(S.gabFrom)}.${S.gabFrom === 'ENA 2027 — conferir alternativas' ? ' As alternativas do modelo anterior foram mantidas; confira ou importe o gabarito da aplicação.' : ''} Toque numa letra para alterar. "Anulada" dá o ponto às respostas sem dupla marcação. Dupla marcação sempre vale zero. Mudar aqui recalcula todas as notas.</div>
   <div class="row" style="margin:10px 0"><button class="btn" data-act="gabpdf">Importar de PDF</button></div>
   <div class="gab">${rows}</div>
   <h2>Ajustes</h2>
@@ -1907,7 +1916,7 @@ function renderExp() {
   <div class="note">${n} cartão(ões) gravados${rev ? ` · <b>${rev}</b> ainda com alerta de revisão` : ''}. Você pode exportar a qualquer momento com o que já foi corrigido.</div>
   <div class="row" style="flex-direction:column;align-items:stretch;margin:12px 0"><button class="btn pri" data-act="xlsx">Planilha (.xlsx): nome, CPF, acertos, nota, respostas</button>
   <button class="btn" data-act="pdfx">PDF com todos os cartões anotados</button></div>
-  <div class="note">No PDF, cada página é o cartão do aluno com ✓ verde nos acertos, ✗ vermelho nos erros (a resposta certa aparece ao lado) e o total no campo "Total de acertos na prova".</div>
+  <div class="note">No PDF, cada página é o cartão do aluno com ✓ verde nos acertos, ✗ vermelho nos erros (a resposta certa aparece ao lado), 0 laranja nas questões zeradas por dupla marcação e o total no campo "Total de acertos na prova".</div>
   <h2>Dados neste aparelho</h2>
   <div class="note">Os cartões, fotos e notas ficam só neste navegador (nada é enviado a servidor). Se limpar os dados do navegador, eles somem, então exporte antes.</div>
   <div class="row" style="margin-top:10px"><button class="btn dng" data-act="wipe">Apagar todos os cartões</button></div>`;
@@ -1915,12 +1924,12 @@ function renderExp() {
 
 /* ---------- revisão ---------- */
 function rowHtml(c, q) {
-  const st = c.st[q], a = c.ans[q], g = S.gab[q], fl = st === 'double' || st === 'weak';
-  const lab = st === 'double' ? 'dupla marcação' : st === 'weak' ? 'marcação fraca' : st === 'blank' ? 'em branco' : (c.man[q] ? 'ajustada' : '');
+  const st = c.st[q], a = c.ans[q], g = S.gab[q], double = isDouble(c, q), fl = double || st === 'weak';
+  const lab = double ? 'dupla marcação — zerada (0)' : st === 'weak' ? 'marcação fraca' : st === 'blank' ? 'em branco' : (c.man[q] ? 'ajustada' : '');
   const chips = [0, 1, 2, 3, 4].map(k => {
     let cl = 'chip';
-    if (a === k) cl += (g === 5 || g === k) ? ' ok' : ' bad';
-    else if (a === -2 && c.fills[q][k] >= thr().strong) cl += ' dbl';
+    if (double) { if (c.fills[q][k] >= thr().strong) cl += ' dbl'; }
+    else if (a === k) cl += (g === 5 || g === k) ? ' ok' : ' bad';
     else if (g === k && a !== k) cl += ' key';
     return `<button class="${cl}" data-set="${q},${k}" aria-label="Questão ${q + 1} alternativa ${LET[k]}">${LET[k]}</button>`;
   }).join('');
@@ -1992,7 +2001,7 @@ function pvSoon(c) {
 }
 function applyOnly() {
   const c = S.cards.find(x => x.id === S.openId); if (!c) return;
-  for (let q = 0; q < NQ; q++) { const r = $('#q' + q); if (r) r.style.display = (S.onlyAlerts && !(c.st[q] === 'double' || c.st[q] === 'weak')) ? 'none' : ''; }
+  for (let q = 0; q < NQ; q++) { const r = $('#q' + q); if (r) r.style.display = (S.onlyAlerts && !(isDouble(c, q) || c.st[q] === 'weak')) ? 'none' : ''; }
 }
 function setAns(c, q, k) {
   if (c.ans[q] === k) { c.ans[q] = -1; c.st[q] = 'blank'; } else { c.ans[q] = k; c.st[q] = 'ok'; }
@@ -2017,7 +2026,7 @@ async function sheetAction(a) {
   if (a === 'prev' || a === 'next') { await saveCard(c); const n = ids[pos + (a === 'next' ? 1 : -1)]; if (n) { S.openId = n; drawSheet(S.cards.find(x => x.id === n)); $('#sheet .ovbody').scrollTop = 0; } return; }
   if (a === 'okrev') {
     c.rev = !c.rev; await saveCard(c);
-    if (c.rev) { const nxt = visibleCards().find(x => needsReview(x) && x.id !== c.id); if (nxt) { S.openId = nxt.id; drawSheet(nxt); $('#sheet .ovbody').scrollTop = 0; toast('Revisado. Próximo com alerta'); return; } toast('Revisado'); }
+    if (c.rev) { const nxt = visibleCards().find(x => needsReview(x) && x.id !== c.id); if (nxt) { S.openId = nxt.id; drawSheet(nxt); $('#sheet .ovbody').scrollTop = 0; toast('Revisado. Próximo com alerta'); return; } await closeSheet(); toast('Revisão concluída'); return; }
     return drawSheet(c);
   }
   if (a === 'del') {
@@ -2197,7 +2206,7 @@ document.addEventListener('change', async e => {
     catch (err) { toast(err.message, 4000); } t.value = '';
   }
   else if (t.id === 'cfgExam') { S.cfg.exam = t.value.trim() || 'Prova'; saveKV('cfg', S.cfg); renderHeader(); }
-  else if (t.id === 'cfgMax') { S.cfg.max = Math.max(1, parseFloat(t.value) || 10); saveKV('cfg', S.cfg); }
+  else if (t.id === 'cfgMax') { S.cfg.max = Math.max(1, parseFloat(t.value) || 30); saveKV('cfg', S.cfg); }
   else if (t.id === 'cfgOcr') { S.cfg.ocr = t.value; OCRE.unavailable = ''; saveKV('cfg', S.cfg); toast('Motor OCR atualizado para novas leituras'); }
   else if (t.id === 'cfgSens') { S.cfg.sens = t.value; saveKV('cfg', S.cfg); reclassifyAll(); toast('Leitura recalculada'); }
 });
@@ -2210,6 +2219,15 @@ document.addEventListener('change', async e => {
       const kv = await DB.all('kv');
       for (const r of kv) { if (r.k === 'gab' && r.v && r.v.g && r.v.g.length === NQ) { S.gab = r.v.g; S.gabFrom = r.v.from || S.gabFrom; } if (r.k === 'cfg' && r.v) Object.assign(S.cfg, r.v); }
       S.cards = (await DB.all('cards')).sort((a, b) => a.t - b.t);
+      // Atualização única dos padrões para quem já utilizava a edição anterior.
+      if (!kv.some(r => r.k === 'uiEna2027' && r.v === 1)) {
+        if (!S.cfg.exam || S.cfg.exam === 'ENA 2026') S.cfg.exam = 'ENA 2027';
+        S.cfg.max = 30;
+        if (S.gabFrom === 'ENA 2026 (PDF enviado)') S.gabFrom = 'ENA 2027 — conferir alternativas';
+        await DB.put('kv', { k: 'cfg', v: S.cfg });
+        await DB.put('kv', { k: 'gab', v: { g: S.gab, from: S.gabFrom } });
+        await DB.put('kv', { k: 'uiEna2027', v: 1 });
+      }
     } catch (e) { console.warn(e); S.memOnly = true; }
     try { if (navigator.storage && navigator.storage.persist) S.persist = await navigator.storage.persist(); } catch (e) { }
   }
