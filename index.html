@@ -111,9 +111,11 @@ h2{font-size:15px;margin:18px 0 8px}
 .ovfoot{display:flex;gap:8px;padding:8px 10px;border-top:1px solid var(--line);background:var(--surf)}
 .ovfoot .btn{flex:1}
 .rv{display:grid;grid-template-columns:1fr;gap:0}
-@media(min-width:900px){[data-sh="view"]{display:none}.rv{grid-template-columns:minmax(300px,420px) 1fr;height:100%}.rv .pane{overflow:auto}.rv .imgpane{display:block!important;border-right:1px solid var(--line)}}
+@media(min-width:900px){[data-sh="view"]{display:none}.rv{grid-template-columns:minmax(0,1fr) minmax(0,1fr);height:100%}.rv .imgpane{overflow:auto}.rv .pane{overflow:auto}.rv .imgpane{display:block!important;border-right:1px solid var(--line)}}
 .imgpane{display:none;padding:10px}
 .imgpane img{width:100%;height:auto;border:1px solid var(--line);background:#fff;display:block}
+.imgpane button{all:unset;display:block;width:100%;cursor:zoom-in}
+.imgpane .note{margin-top:6px;text-align:center}
 .pane{padding:12px 14px 24px}
 .fld{margin-bottom:10px}
 .fld label{display:block;font-size:12.5px;color:var(--mut);margin-bottom:3px}
@@ -722,6 +724,35 @@ function fitH(src, dst) {
 }
 
 /* ---------- warp: espaço canônico -> imagem de origem (bilinear) ---------- */
+/* Tom de cinza para ler marcações. Anotações coloridas feitas por outro corretor (círculos azuis,
+   vermelhos, verdes; cor pura e clara) viram papel; caneta azul ou preta, que é escura, continua tinta. */
+function inkGray(r, g, b) {
+  const mx = r > g ? (r > b ? r : b) : (g > b ? g : b), mn = r < g ? (r < b ? r : b) : (g < b ? g : b);
+  const lum = 0.299 * r + 0.587 * g + 0.114 * b;
+
+  /* Caneta azul — versão 2.
+     Nas digitalizações reais, uma mesma marca azul vai desde pixels muito escuros até bordas
+     azul-claras (por antialiasing, compressão e iluminação). A regra anterior preservava bem
+     apenas o miolo escuro e ainda descartava parte importante dessas bordas como "anotação
+     colorida". Isso diminuía a área preenchida e algumas marcações legítimas ficavam abaixo
+     do limiar STRONG, aparecendo como "marcação fraca".
+
+     Aqui identificamos azul pela DOMINÂNCIA cromática, e não por uma faixa estreita de RGB.
+     Quando o pixel tem assinatura clara de tinta azul, limitamos seu nível de cinza a 125:
+     ele passa a contar como tinta mesmo quando a digitalização o deixou relativamente claro.
+     Papel branco/cinza e impressão preta não satisfazem essa dominância. Os retângulos azuis
+     gerados pelo próprio corretor ficam essencialmente na borda externa das alternativas e
+     não entram na área interna usada em readFills(). */
+  const bluePen = b >= 55 && r < 245 && g < 245 &&
+                  (b - r) >= 12 && (b - g) >= 6 &&
+                  ((b - r) + (b - g)) >= 24;
+  if (bluePen) return Math.min(125, (lum + 0.5) | 0);
+
+  /* Outras cores saturadas (vermelho/verde/azul de anotações externas) continuam sendo
+     neutralizadas como papel para não virarem marcações espúrias. */
+  if ((mx >= 150 && mn <= 0.45 * mx) || (mx >= 220 && mx - mn >= 35)) return mx;
+  return (lum + 0.5) | 0;
+}
 function warpRGBA(src, sw, sh, Hcs, s) {
   const w = Math.round(CW * s), h = Math.round(CH * s);
   const rgba = new Uint8ClampedArray(w * h * 4), gray = new Uint8Array(w * h);
@@ -743,7 +774,7 @@ function warpRGBA(src, sw, sh, Hcs, s) {
       const g = src[i00 + 1] * w00 + src[i10 + 1] * w10 + src[i01 + 1] * w01 + src[i11 + 1] * w11;
       const b = src[i00 + 2] * w00 + src[i10 + 2] * w10 + src[i01 + 2] * w01 + src[i11 + 2] * w11;
       rgba[o4] = r; rgba[o4 + 1] = g; rgba[o4 + 2] = b; rgba[o4 + 3] = 255;
-      gray[o] = (0.299 * r + 0.587 * g + 0.114 * b + 0.5) | 0;
+      gray[o] = inkGray(r, g, b);
     }
   }
   return { w, h, rgba, gray };
@@ -994,7 +1025,11 @@ function strokeEvidence(gray, fills, offs, thresholds) {
     });
   });
 }
-function hasStroke(e) { return !!e && e.ink >= .025 && e.largest >= 20; }
+/* Traço em outra alternativa (rasura). Medido em 40 cartões reais: rasuras de caneta ficaram com
+   tinta >= 6,9% da alternativa e traço contínuo >= 41 px; pedaços da moldura, no máximo 3,8% e 36 px.
+   O corte fica entre os dois e acompanha o "Rigor da leitura dos balões". */
+const STROKE_THR = { rig: { ink: .08, big: 60 }, nor: { ink: .05, big: 40 }, sen: { ink: .04, big: 32 } };
+function hasStroke(e) { const s = STROKE_THR[(typeof S !== 'undefined' && S.cfg && S.cfg.sens) || 'nor'] || STROKE_THR.nor; return !!e && e.ink >= s.ink && e.largest >= s.big; }
 function markedAlternative(c, q, k) { return c.fills[q][k] >= thr().weak || hasStroke(c.evidence?.[q]?.[k]); }
 
 /* caixas "Ausente" / "Eliminado" (canto superior) */
@@ -1048,7 +1083,6 @@ function classify(fills, thr, evidence) {
     for(let k=0;k<5;k++) {
       const e=evidence?.[q]?.[k];
       if(f[k]>=thr.weak || hasStroke(e)) marked.push(k);
-      else if(e && e.ink>=.012 && e.largest>=12) faint.push(k);
     }
     // Uma marca secundária não precisa estar totalmente preenchida para zerar a questão.
     if(marked.length>=2){ans.push(-2);st.push('double');}
@@ -1781,10 +1815,12 @@ async function rereadMarks(c) {
     const cv = await fileToCanvas(c.img), canonical = document.createElement('canvas');
     canonical.width = CW; canonical.height = CH;
     canonical.getContext('2d').drawImage(cv,0,0,CW,CH);
-    const gray = headerFromCanvas(canonical).gray, found = findMarkers(gray,CW,CH,1).found;
+    const cd = canonical.getContext('2d').getImageData(0,0,CW,CH).data, gray = new Uint8Array(CW*CH);
+    for (let i = 0; i < gray.length; i++) gray[i] = inkGray(cd[4*i], cd[4*i+1], cd[4*i+2]);
+    const found = findMarkers(gray,CW,CH,1).found;
     const rf = readFills(gray,found), cl = classify(rf.fills,thr(),rf.evidence), fl = readFlags(gray);
     if (S.openId !== c.id) return;
-    c.fills=rf.fills; c.offs=rf.offs; c.evidence=rf.evidence; c.flagRead=fl; c.detectionVersion=2;
+    c.fills=rf.fills; c.offs=rf.offs; c.evidence=rf.evidence; c.flagRead=fl; c.detectionVersion=3;
     for(let q=0;q<NQ;q++) if(!c.man[q]) {c.ans[q]=cl.ans[q];c.st[q]=cl.st[q];}
     const situation=flagDecision(fl,c.ans);
     for(const k of ['aus','eli']) if(!c.flagManual?.[k]) c[k]=situation[k];
@@ -1839,7 +1875,8 @@ function reclassifyAll() {
     saveCard(c);
   }
 }
-function sortedCards() { return S.cards.slice().sort((a, b) => a.t - b.t); }
+const byName = (a, b) => (a.name ? 0 : 1) - (b.name ? 0 : 1) || (a.name || '').localeCompare(b.name || '', 'pt-BR', { sensitivity: 'base' }) || a.t - b.t;
+function sortedCards() { return S.cards.slice().sort(byName); }
 function visibleCards() {
   const q = S.q.trim().toLowerCase(), qd = q.replace(/\D/g, '');
   return S.cards.filter(c => {
@@ -1848,7 +1885,7 @@ function visibleCards() {
     if (S.filter === 'aus' && !(c.aus || c.eli)) return false;
     if (q && !((c.name || '').toLowerCase().includes(q) || (qd && (c.cpf || '').replace(/\D/g, '').includes(qd)))) return false;
     return true;
-  }).sort((a, b) => a.t - b.t);
+  }).sort(byName);
 }
 
 /* ================= leitura de imagens ================= */
@@ -1907,7 +1944,7 @@ async function cardFromScan(r, meta) {
   }
   return {
     id: uid(), t: Date.now(), src: meta.src, file: meta.file || '', page: meta.page || 0,
-    name, cpf, nameSrc, nameLow, cpfLow, ocrCrop, ocrEngine, ocrNotice, ocrDetails: o, fills: rf.fills, offs: rf.offs, evidence: rf.evidence, flagRead: fl, detectionVersion: 2, ans: cl.ans, st: cl.st,
+    name, cpf, nameSrc, nameLow, cpfLow, ocrCrop, ocrEngine, ocrNotice, ocrDetails: o, fills: rf.fills, offs: rf.offs, evidence: rf.evidence, flagRead: fl, detectionVersion: 3, ans: cl.ans, st: cl.st,
     man: new Array(NQ).fill(false), ...situation, flagManual: {}, rev: false, img, thumb, inl: r.inliers
   };
 }
@@ -2187,7 +2224,7 @@ function drawSheet(c) {
   const fromCam = S.sheetOpts && S.sheetOpts.cam;
   sh.innerHTML = `<div class="ovbar"><button class="btn" data-sh="close">${S.sheetOpts && S.sheetOpts.cam ? '‹ Câmera' : '‹ Lista'}</button><span class="ttl">${esc(c.name || 'Sem nome')}</span>
     ${ids.length ? `<button class="btn" data-sh="prev" ${pos <= 0 ? 'disabled' : ''} aria-label="Anterior">‹</button><button class="btn" data-sh="next" ${pos < 0 || pos >= ids.length - 1 ? 'disabled' : ''} aria-label="Próximo">›</button>` : ''}</div>
-  <div class="ovbody"><div class="rv"><div class="imgpane" id="imgpane"><img id="pvimg" alt="Cartão anotado"></div><div class="pane">
+  <div class="ovbody"><div class="rv"><div class="imgpane" id="imgpane"><button data-sh="zoom" aria-label="Ampliar o cartão"><img id="pvimg" alt="Cartão anotado"></button><div class="note">Clique na imagem para ampliar.</div></div><div class="pane">
     <div class="big"><b id="scBig"></b><span id="scSub"></span></div>
     <div class="row" style="margin-bottom:8px"><button class="btn" data-sh="view">Ver cartão anotado</button></div>
     <div id="alerts"></div>
@@ -2227,7 +2264,7 @@ function pvSoon(c) {
   clearTimeout(pvT);
   pvT = setTimeout(async () => {
     const img = $('#pvimg'); if (!img || S.openId !== c.id) return;
-    const cv = await annotate(c, 0.7), b = await blobOf(cv, 'image/jpeg', 0.8);
+    const cv = await annotate(c, 1), b = await blobOf(cv, 'image/jpeg', 0.85);
     const old = img.src; img.src = URL.createObjectURL(b); if (old.startsWith('blob:')) URL.revokeObjectURL(old);
   }, 250);
 }
@@ -2251,7 +2288,7 @@ async function sheetAction(a) {
   const c = S.cards.find(x => x.id === S.openId); if (!c) return;
   const ids = visibleCards().map(x => x.id), pos = ids.indexOf(c.id);
   if (a === 'close') return closeSheet();
-  if (a === 'view') return showViewer(c);
+  if (a === 'view' || a === 'zoom') return showViewer(c);
   if (a === 'ocr') return rereadIdentity(c);
   if (a === 'marks') return rereadMarks(c);
   if (a === 'only') { S.onlyAlerts = !S.onlyAlerts; const b = $('[data-sh="only"]'); b.classList.toggle('on', S.onlyAlerts); b.textContent = S.onlyAlerts ? 'Mostrando só alertas' : 'Mostrar só alertas'; return applyOnly(); }
