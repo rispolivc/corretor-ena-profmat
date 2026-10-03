@@ -153,13 +153,11 @@ kbd{font:inherit;font-weight:700}
   </header>
   <main>
     <section class="view on" id="v-list"></section>
-    <section class="view" id="v-cam"></section>
     <section class="view" id="v-gab"></section>
     <section class="view" id="v-exp"></section>
   </main>
   <nav class="tabs" id="tabs">
     <button data-tab="list" class="on"><svg viewBox="0 0 24 24"><rect x="4" y="3" width="16" height="18" rx="2"/><path d="M8 8h8M8 12h8M8 16h5"/></svg>Provas</button>
-    <button data-tab="cam"><svg viewBox="0 0 24 24"><path d="M4 8h3l2-3h6l2 3h3v11H4z"/><circle cx="12" cy="13" r="3.5"/></svg>Câmera</button>
     <button data-tab="gab"><svg viewBox="0 0 24 24"><path d="M5 12l4 4 10-10"/><path d="M5 20h14"/></svg>Gabarito</button>
     <button data-tab="exp"><svg viewBox="0 0 24 24"><path d="M12 3v12M7 10l5 5 5-5"/><path d="M5 20h14"/></svg>Exportar</button>
   </nav>
@@ -170,8 +168,7 @@ kbd{font:inherit;font-weight:700}
 <div class="ov ovc" id="dlg" hidden></div>
 <div id="toast"></div>
 <input type="file" id="fPdf" accept="application/pdf,.pdf" multiple hidden>
-<input type="file" id="fImg" accept="image/*" multiple hidden>
-<input type="file" id="fCam" accept="image/*" capture="environment" hidden>
+<input type="file" id="fRoster" accept=".xlsx,.xls,.csv" hidden>
 <input type="file" id="fGab" accept="application/pdf,.pdf" hidden>
 
 <script>/**
@@ -656,7 +653,7 @@ const TPL = (() => {
   }
   return a;
 })();
-const BOX_DX = 74.5, BOX_STEP = 77, BOX_W = 54.5, BOX_H = 25;
+let BOX_DX = 74.5, BOX_STEP = 77, BOX_W = 54.5, BOX_H = 25;
 function boxRect(q, k, off) {
   const s = TPL[q];
   return { x: s.x + (off ? off.dx : 0) + BOX_DX + BOX_STEP * k, y: s.y + (off ? off.dy : 0), w: BOX_W, h: BOX_H };
@@ -862,18 +859,31 @@ function findMarkers(gray, w, h, s) {
     const Hn = fitH(srcP, dstP); if (!Hn) break; H = Hn;
   }
   if (!H) return { inliers: 0 };
-  const found = new Array(NQ).fill(null); let inl = 0;
-  const used = new Set();
-  for (let q = 0; q < NQ; q++) {
-    const p = pred(q); let best = -1, bd = 8;
-    for (let i = 0; i < cands.length; i++) {
-      if (used.has(i)) continue;
-      const d = Math.hypot(cands[i].X - p[0], cands[i].Y - p[1]);
-      if (d < bd) { bd = d; best = i; }
+  /* Em fotos, a grade pode encaixar uma linha acima ou abaixo (28 dos 30 quadrados ainda coincidem).
+     Testa os dois deslocamentos de uma linha e fica com o encaixe que coincide mais. */
+  const pitchY = TPL[1].y - TPL[0].y;
+  const assign = (sL, sR = sL) => {
+    const found = new Array(NQ).fill(null), used = new Set(), src = [], dst = []; let inl = 0;
+    for (let q = 0; q < NQ; q++) {
+      const p = apply3(H, tc[q][0], tc[q][1] + (q < 15 ? sL : sR) * pitchY); let best = -1, bd = 8;
+      for (let i = 0; i < cands.length; i++) {
+        if (used.has(i)) continue;
+        const d = Math.hypot(cands[i].X - p[0], cands[i].Y - p[1]);
+        if (d < bd) { bd = d; best = i; }
+      }
+      if (best >= 0) { used.add(best); inl++; found[q] = { x: cands[best].X, y: cands[best].Y }; src.push(tc[q]); dst.push([cands[best].X, cands[best].Y]); }
     }
-    if (best >= 0) { used.add(best); inl++; found[q] = { x: cands[best].X, y: cands[best].Y }; }
+    return { inl, found, src, dst };
+  };
+  let a0 = assign(0);
+  // cada coluna pode ter encaixado uma linha fora, de forma independente
+  for (let it = 0; it < 2; it++) {
+    let best = null;
+    for (const sL of [-1, 0, 1]) for (const sR of [-1, 0, 1]) { if (!sL && !sR) continue; const a = assign(sL, sR); if (a.inl > a0.inl && (!best || a.inl > best.inl)) best = a; }
+    if (!best || best.src.length < 6) break;
+    const Hn = fitH(best.src, best.dst); if (!Hn) break; H = Hn; a0 = assign(0);
   }
-  return { inliers: inl, R: H, found, ncand: cands.length };
+  return { inliers: a0.inl, R: H, found: a0.found, ncand: cands.length };
 }
 
 /* ---------- localizar a folha (quadrilátero claro) numa foto ---------- */
@@ -957,35 +967,130 @@ function processSource(src, sw, sh, cands, opts) {
 }
 
 /* ---------- leitura das marcações ---------- */
+function shiftRect(r, s) { return s ? { x: r.x + s[0], y: r.y + s[1], w: r.w, h: r.h } : r; }
+/* Encaixe fino dos balões pela moldura impressa.
+   Para cada balão, procura (±7 px na horizontal, ±5 na vertical) a posição em que a moldura fica escura
+   e o anel logo por dentro dela fica claro. Balões vazios dão um encaixe nítido; os preenchidos, não.
+   Por isso, em cada linha ajusta uma reta (deslocamento x = a + b·alternativa) só com os encaixes
+   nítidos e aplica a todos os balões da linha. */
+function refineBoxes(gray, rowOff, thresholds) {
+  const out = [], W = BOX_W, Hh = BOX_H;
+  for (let q = 0; q < NQ; q++) {
+    const P = thresholds[q] / 0.62, dk = (x, y) => { const v = gray[y * CW + x]; return v >= P ? 0 : (P - v) / P; };
+    const fits = [];
+    for (let k = 0; k < 5; k++) {
+      const r = boxRect(q, k, rowOff[q]), bx = Math.round(r.x), by = Math.round(r.y), Wr = Math.round(W), Hr = Math.round(Hh);
+      let best = null, sum = 0, cnt = 0;
+      for (let dy = -5; dy <= 5; dy++) for (let dx = -7; dx <= 7; dx++) {
+        const x0 = bx + dx, y0 = by + dy; let edge = 0, ring = 0, ne = 0, nr = 0;
+        for (let x = x0 + 3; x <= x0 + Wr - 3; x += 2) { edge += dk(x, y0) + dk(x, y0 + Hr); ne += 2; if (CARD.glyphs && x - x0 >= 12 && x - x0 <= 34) continue; ring += dk(x, y0 + 3) + dk(x, y0 + Hr - 3); nr += 2; }
+        for (let y = y0 + 3; y <= y0 + Hr - 3; y += 2) { edge += dk(x0, y) + dk(x0 + Wr, y); ring += dk(x0 + 3, y) + dk(x0 + Wr - 3, y); ne += 2; nr += 2; }
+        const s = edge / ne - ring / nr; sum += s; cnt++;
+        if (!best || s > best.s) best = { s, dx, dy };
+      }
+      fits.push({ k, dx: best.dx, dy: best.dy, w: Math.max(0, best.s - 0.12) * Math.max(0, best.s - sum / cnt) });
+    }
+    const good = fits.filter(f => f.w > 0);
+    let row;
+    if (good.length >= 2) {
+      const sw = good.reduce((a, f) => a + f.w, 0), mk = good.reduce((a, f) => a + f.w * f.k, 0) / sw, mx = good.reduce((a, f) => a + f.w * f.dx, 0) / sw;
+      const vk = good.reduce((a, f) => a + f.w * (f.k - mk) ** 2, 0), b = vk > 1e-6 ? good.reduce((a, f) => a + f.w * (f.k - mk) * (f.dx - mx), 0) / vk : 0;
+      const my = good.reduce((a, f) => a + f.w * f.dy, 0) / sw;
+      row = fits.map(f => [Math.max(-7, Math.min(7, Math.round(mx + b * (f.k - mk)))), Math.max(-5, Math.min(5, Math.round(my)))]);
+    } else if (good.length === 1) row = fits.map(() => [good[0].dx, good[0].dy]);
+    else row = fits.map(() => [0, 0]);
+    out.push(row);
+  }
+  return out;
+}
 function readFills(gray, found) {
-  const fills = [], offs = [], thresholds = [];
+  const fills = [], offs = [], thresholds = [], ltests = [], rowOff = [];
+  // 1ª passada: alinhamento e limiar de cada linha
   for (let q = 0; q < NQ; q++) {
     const t = TPL[q]; let dx = 0, dy = 0;
     const f = found && found[q];
     if (f) { dx = f.x - (t.x + t.w / 2); dy = f.y - (t.y + t.h / 2); if (Math.abs(dx) > 8 || Math.abs(dy) > 8) { dx = 0; dy = 0; } }
-    const off = { dx, dy }; offs.push([Math.round(dx * 10) / 10, Math.round(dy * 10) / 10]);
+    const off = { dx, dy }; rowOff.push(off); offs.push([Math.round(dx * 10) / 10, Math.round(dy * 10) / 10]);
     const rA = boxRect(q, 0, off), rE = boxRect(q, 4, off);
     // nível do papel da linha (percentil 85)
     const hist = new Uint32Array(256); let cnt = 0;
     for (let y = Math.round(rA.y); y < Math.round(rA.y + rA.h); y++)
       for (let x = Math.round(rA.x); x < Math.round(rE.x + rE.w); x++) { hist[gray[y * CW + x]]++; cnt++; }
     let acc = 0, P = 255; for (let i = 255; i >= 0; i--) { acc += hist[i]; if (acc >= cnt * 0.15) { P = i; break; } }
-    const T = Math.max(60, P * 0.62); thresholds.push(T);
-    const row = [];
+    thresholds.push(Math.max(60, P * 0.62));
+  }
+  // encaixe fino de cada balão (fotos e digitalizações de baixa resolução deslocam os balões alguns pixels)
+  const bsh = refineBoxes(gray, rowOff, thresholds);
+  // letras impressas aprendidas no próprio cartão (modelos com letra dentro do balão)
+  const learned = CARD.glyphs ? learnLetters(gray, rowOff, thresholds, bsh) : null;
+  // 2ª passada: preenchimento sem a letra
+  for (let q = 0; q < NQ; q++) {
+    const off = rowOff[q], T = thresholds[q], row = [], lrow = []; ltests.push(lrow);
     for (let k = 0; k < 5; k++) {
-      const r = boxRect(q, k, off);
+      const r = shiftRect(boxRect(q, k, off), bsh[q][k]), isLetter = (learned && learned.test(q, k, r, T)) || letterTest(gray, r, k, T); lrow.push(isLetter);
       const xa = Math.round(r.x + 6), xb = Math.round(r.x + r.w - 6), ya = Math.round(r.y + 5), yb = Math.round(r.y + r.h - 5);
       let dark = 0, n = 0;
-      for (let y = ya; y < yb; y++) for (let x = xa; x < xb; x++) { n++; if (gray[y * CW + x] < T) dark++; }
+      for (let y = ya; y < yb; y++) for (let x = xa; x < xb; x++) { if (isLetter && isLetter(x, y)) continue; n++; if (gray[y * CW + x] < T) dark++; }
       row.push(n ? dark / n : 0);
     }
     fills.push(row.map(v => Math.round(v * 1000) / 1000));
   }
-  return { fills, offs, evidence: strokeEvidence(gray, fills, offs, thresholds) };
+  return { fills, offs, evidence: strokeEvidence(gray, fills, offs, thresholds, ltests, bsh) };
+}
+/* Aprende, em cada cartão, como a letra de cada alternativa aparece impressa (posição, tamanho,
+   espessura). Em cada coluna (A, B, …) de cada metade do cartão, a maioria dos 15 balões está vazia:
+   a imagem "típica" da coluna (percentil claro, pixel a pixel) é o balão vazio com a letra.
+   Assim deslocamentos de impressão, escala da impressora ou foto não viram tinta.
+   Se uma coluna tiver balões marcados demais para aprender, usa as 30 linhas juntas e, em último
+   caso, o desenho oficial da letra. */
+function learnLetters(gray, rowOff, thresholds, bsh) {
+  const PAD = 4, pw = Math.round(BOX_W) + 2 * PAD, ph = Math.round(BOX_H) + 2 * PAD;
+  const Tc = thresholds.slice().sort((a, b) => a - b)[thresholds.length >> 1];
+  const patchAt = (q, k) => { const r = shiftRect(boxRect(q, k, rowOff[q]), bsh && bsh[q][k]); return { x0: Math.round(r.x) - PAD, y0: Math.round(r.y) - PAD }; };
+  function build(rows, k) {
+    const n = rows.length, vals = new Uint8Array(n), core = new Uint8Array(pw * ph), dil = new Uint8Array(pw * ph);
+    const rank = Math.min(n - 1, Math.floor(0.75 * (n - 1)));
+    for (let y = 0; y < ph; y++) for (let x = 0; x < pw; x++) {
+      rows.forEach((q, i) => { const p = patchAt(q, k); vals[i] = gray[(p.y0 + y) * CW + p.x0 + x]; });
+      const s = Array.from(vals.subarray(0, n)).sort((a, b) => a - b);
+      core[y * pw + x] = s[rank] < Tc ? 1 : 0;
+    }
+    // só o miolo do balão interessa (a moldura já fica fora da área lida)
+    for (let y = 0; y < ph; y++) for (let x = 0; x < pw; x++) if (x < PAD + 4 || x >= pw - PAD - 4 || y < PAD + 2 || y >= ph - PAD - 2) core[y * pw + x] = 0;
+    let on = 0; const pts = [];
+    for (let y = 0; y < ph; y++) for (let x = 0; x < pw; x++) if (core[y * pw + x]) {
+      on++; pts.push([x, y]);
+      for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) { const yy = y + dy, xx = x + dx; if (yy >= 0 && yy < ph && xx >= 0 && xx < pw) dil[yy * pw + xx] = 1; }
+    }
+    // letra plausível: ocupa entre ~3% e 35% do miolo
+    const inner = (pw - 2 * PAD - 8) * (ph - 2 * PAD - 4), frac = on / inner;
+    return frac > 0.03 && frac < 0.35 ? { pts, dil } : null;
+  }
+  const L = [], R = [], all = [];
+  for (let q = 0; q < NQ; q++) { (q < 15 ? L : R).push(q); all.push(q); }
+  const tpl = [];
+  for (let k = 0; k < 5; k++) {
+    const pooled = build(all, k);
+    tpl.push([build(L, k) || pooled, build(R, k) || pooled]);
+  }
+  return {
+    test(q, k, r, T) {
+      const g = tpl[k][q < 15 ? 0 : 1]; if (!g) return null;
+      const bx = Math.round(r.x) - PAD, by = Math.round(r.y) - PAD;
+      let best = -1, sx = 0, sy = 0;
+      for (let dy = -3; dy <= 3; dy++) for (let dx = -3; dx <= 3; dx++) {
+        let s = 0; for (const [x, y] of g.pts) if (gray[(by + y + dy) * CW + bx + x + dx] < T) s++;
+        s -= 0.01 * (Math.abs(dx) + Math.abs(dy));
+        if (s > best) { best = s; sx = dx; sy = dy; }
+      }
+      const x0 = bx + sx, y0 = by + sy;
+      return (x, y) => { const i = x - x0, j = y - y0; return i >= 0 && j >= 0 && i < pw && j < ph && g.dil[j * pw + i] === 1; };
+    }
+  };
 }
 /* Evidência de traços: calibra a moldura pelas alternativas vazias da mesma linha.
    Assim o interior pode incluir marcas próximas da borda sem contar a própria moldura. */
-function strokeEvidence(gray, fills, offs, thresholds) {
+function strokeEvidence(gray, fills, offs, thresholds, ltests, bsh) {
   const round3 = v => Math.round(v * 1000) / 1000;
   function edge(r, axis, end, T) {
     const pos = axis === 0 ? r.x + end * r.w : r.y + end * r.h, candidates = [];
@@ -1001,7 +1106,7 @@ function strokeEvidence(gray, fills, offs, thresholds) {
     return peaks.reduce((s, c) => s + c.p, 0) / peaks.length;
   }
   return fills.map((row, q) => {
-    const off = { dx: offs[q][0], dy: offs[q][1] }, boxes = row.map((_, k) => boxRect(q, k, off));
+    const off = { dx: offs[q][0], dy: offs[q][1] }, boxes = row.map((_, k) => shiftRect(boxRect(q, k, off), bsh && bsh[q][k]));
     const blank = row.map((v, k) => v < .08 ? k : -1).filter(k => k >= 0), T = thresholds?.[q] || 155;
     const corrections = [[0,0],[0,1],[1,0],[1,1]].map(([axis,end]) => {
       const points = blank.map(k => {
@@ -1015,13 +1120,22 @@ function strokeEvidence(gray, fills, offs, thresholds) {
       return row.map((_, k) => Math.max(-7, Math.min(7, my+slope*(k-mx))));
     });
     return boxes.map((r, k) => {
+      const lt = ltests?.[q]?.[k];
       const xa = Math.round(r.x+corrections[0][k]+2.5), xb = Math.round(r.x+r.w+corrections[1][k]-2.5);
       const ya = Math.round(r.y+corrections[2][k]+2.5), yb = Math.round(r.y+r.h+corrections[3][k]-2.5);
       const w = Math.max(1,xb-xa), h = Math.max(1,yb-ya), mask = new Uint8Array(w*h);
       for (let y=0;y<h;y++) for(let x=0;x<w;x++) mask[y*w+x] = gray[(ya+y)*CW+xa+x] < T ? 1 : 0;
       // Exclui pontos isolados; mantém também traços estreitos e compridos.
-      const parts = _cc(mask,w,h).filter(c => c.a>=12 && c.h>=3 && c.w>=2);
-      return { ink: round3(parts.reduce((s,c)=>s+c.a,0)/(w*h)), largest: Math.max(0,...parts.map(c=>c.a)) };
+      const comps = _cc(mask,w,h);
+      // área de cada componente (sem os pixels da letra impressa) e quanto dela fica colado à borda
+      const area = new Float64Array(comps.length + 1), rim = new Float64Array(comps.length + 1);
+      for (let y=0;y<h;y++) for (let x=0;x<w;x++) { const id = comps.lab[y*w+x]; if (!id || (lt && lt(xa+x, ya+y))) continue; area[id]++; if (x<3 || x>=w-3 || y<3 || y>=h-3) rim[id]++; }
+      let frameDark = 0;
+      for (const c of comps) { c.a = area[c.id]; c.rim = c.a ? rim[c.id] / c.a : 0; if (c.a && c.rim >= 0.85) frameDark += c.a; }
+      // pedaço de moldura que invadiu a área (foto, baixa resolução): fica quase todo colado à borda
+      const parts = comps.filter(c => c.a>=12 && c.h>=3 && c.w>=2 && c.rim < 0.85);
+      const dark = comps.reduce((s,c)=>s+c.a,0);
+      return { ink: round3(parts.reduce((s,c)=>s+c.a,0)/(w*h)), largest: Math.max(0,...parts.map(c=>c.a)), fillAdj: round3((dark-frameDark)/(w*h)) };
     });
   });
 }
@@ -1029,60 +1143,93 @@ function strokeEvidence(gray, fills, offs, thresholds) {
    tinta >= 6,9% da alternativa e traço contínuo >= 41 px; pedaços da moldura, no máximo 3,8% e 36 px.
    O corte fica entre os dois e acompanha o "Rigor da leitura dos balões". */
 const STROKE_THR = { rig: { ink: .08, big: 60 }, nor: { ink: .05, big: 40 }, sen: { ink: .04, big: 32 } };
-function hasStroke(e) { const s = STROKE_THR[(typeof S !== 'undefined' && S.cfg && S.cfg.sens) || 'nor'] || STROKE_THR.nor; return !!e && e.ink >= s.ink && e.largest >= s.big; }
-function markedAlternative(c, q, k) { return c.fills[q][k] >= thr().weak || hasStroke(c.evidence?.[q]?.[k]); }
+function hasStroke(e) {
+  const s = STROKE_THR[(typeof S !== 'undefined' && S.cfg && S.cfg.sens) || 'nor'] || STROKE_THR.nor;
+  return !!e && e.ink >= s.ink && e.largest >= s.big;
+}
+/* preenchimento descontando pedaços de moldura colados à borda (quando a leitura de traços os mediu) */
+function adjFills(fills, evidence) { return fills.map((row, q) => row.map((v, k) => { const e = evidence?.[q]?.[k]; return e && e.fillAdj != null ? Math.min(v, e.fillAdj) : v; })); }
+const _faCache = new WeakMap();
+function adjOf(c) { let a = _faCache.get(c.fills); if (!a) { a = adjFills(c.fills, c.evidence); _faCache.set(c.fills, a); } return a; }
+function markedAlternative(c, q, k) { return adjOf(c)[q][k] >= thr().weak || hasStroke(c.evidence?.[q]?.[k]); }
 
 /* caixas "Ausente" / "Eliminado" (canto superior) */
 const FLAGBOX = { aus: { x: 65, y: 274, w: 85, h: 49 }, eli: { x: 1085, y: 271, w: 86, h: 48 } };
+/* Caixas Ausente / Eliminado.
+   1) Localiza a moldura da caixa (±22 px), com limiar relativo ao papel da região — fotos têm papel cinzento.
+   2) Dentro dela, procura um traço de caneta: componente escuro (relativo ao papel da própria caixa) com
+      tamanho mínimo e que não seja resto da moldura. Sombra e borda deslocada não formam esse traço. */
 function readFlags(gray) {
   const out = {};
   for (const k in FLAGBOX) {
     const b = FLAGBOX[k];
+    const hist = new Uint32Array(256); let tot = 0;
+    for (let y = Math.max(0, b.y - 25); y < Math.min(CH, b.y + b.h + 25); y++) for (let x = Math.max(0, b.x - 25); x < Math.min(CW, b.x + b.w + 25); x++) { hist[gray[y * CW + x]]++; tot++; }
+    let acc = 0, Pl = 255; for (let i = 255; i >= 0; i--) { acc += hist[i]; if (acc >= tot * 0.25) { Pl = i; break; } }
+    const lineT = Math.max(Pl * 0.85, Pl - 22);
     const support = (pos, lo, hi, vertical) => {
-      let dark=0;
-      for(let z=lo;z<hi;z++) {
-        let v=255;
-        for(let d=-1;d<=1;d++) v=Math.min(v,gray[vertical ? z*CW+pos+d : (pos+d)*CW+z]);
-        if(v<210) dark++;
-      }
-      return dark/(hi-lo);
+      let dark = 0;
+      for (let z = lo; z < hi; z++) { let v = 255; for (let d = -1; d <= 1; d++) v = Math.min(v, gray[vertical ? z * CW + pos + d : (pos + d) * CW + z]); if (v < lineT) dark++; }
+      return dark / (hi - lo);
     };
-    // Procura as duas bordas juntas: uma linha do cabeçalho sozinha não basta.
-    let best=null;
-    for(let y=b.y-22;y<=b.y+22;y++) for(let h=b.h-6;h<=b.h+4;h++) {
-      const a=support(y,b.x+12,b.x+b.w-12,false), z=support(y+h,b.x+12,b.x+b.w-12,false);
-      const score=Math.min(a,z)+.25*(a+z)-.002*(Math.abs(y-b.y)+Math.abs(h-b.h));
-      if(!best||score>best.score) best={y,h,score,confidence:Math.min(a,z)};
+    let best = null;
+    for (let y = b.y - 22; y <= b.y + 22; y++) for (let h = b.h - 6; h <= b.h + 4; h++) {
+      const a = support(y, b.x + 12, b.x + b.w - 12, false), z = support(y + h, b.x + 12, b.x + b.w - 12, false);
+      const score = Math.min(a, z) + .25 * (a + z) - .002 * (Math.abs(y - b.y) + Math.abs(h - b.h));
+      if (!best || score > best.score) best = { y, h, score, confidence: Math.min(a, z) };
     }
-    let sides=null;
-    for(let x=b.x-20;x<=b.x+20;x++) for(let w=b.w-8;w<=b.w+5;w++) {
-      const a=support(x,best.y+8,best.y+best.h-8,true), z=support(x+w,best.y+8,best.y+best.h-8,true);
-      const score=Math.min(a,z)+.25*(a+z)-.002*(Math.abs(x-b.x)+Math.abs(w-b.w));
-      if(!sides||score>sides.score) sides={x,w,score,confidence:Math.min(a,z)};
+    let sides = null;
+    for (let x = b.x - 20; x <= b.x + 20; x++) for (let w = b.w - 8; w <= b.w + 5; w++) {
+      const a = support(x, best.y + 8, best.y + best.h - 8, true), z = support(x + w, best.y + 8, best.y + best.h - 8, true);
+      const score = Math.min(a, z) + .25 * (a + z) - .002 * (Math.abs(x - b.x) + Math.abs(w - b.w));
+      if (!sides || score > sides.score) sides = { x, w, score, confidence: Math.min(a, z) };
     }
-    let dark=0,n=0;
-    for(let y=best.y+7;y<best.y+best.h-7;y++) for(let x=sides.x+7;x<sides.x+sides.w-7;x++){n++;if(gray[y*CW+x]<140)dark++;}
-    out[k]=Math.round(dark/Math.max(1,n)*1000)/1000;
-    out[k+'Located']=best.confidence>=.55 && sides.confidence>=.55;
+    // interior (afastado 5 px da moldura) e papel da própria caixa
+    const ix0 = sides.x + 5, ix1 = sides.x + sides.w - 5, iy0 = best.y + 5, iy1 = best.y + best.h - 5, iw = ix1 - ix0, ih = iy1 - iy0;
+    let mark = 0, ink = 0;
+    if (iw > 10 && ih > 10) {
+      const h2 = new Uint32Array(256); for (let y = iy0; y < iy1; y++) for (let x = ix0; x < ix1; x++) h2[gray[y * CW + x]]++;
+      let a2 = 0, Pb = 255; for (let i = 255; i >= 0; i--) { a2 += h2[i]; if (a2 >= iw * ih * 0.4) { Pb = i; break; } }
+      const T = Math.min(Pb * 0.72, Pb - 35), mask = new Uint8Array(iw * ih);
+      for (let y = 0; y < ih; y++) for (let x = 0; x < iw; x++) if (gray[(iy0 + y) * CW + ix0 + x] < T) { mask[y * iw + x] = 1; ink++; }
+      // resto de moldura (grossa ou inclinada na foto): componente quase todo colado à borda do interior
+      const comps = _cc(mask, iw, ih), rim = new Float64Array(comps.length + 1);
+      for (let y = 0; y < ih; y++) for (let x = 0; x < iw; x++) { const id = comps.lab[y * iw + x]; if (id && (x < 4 || x >= iw - 4 || y < 4 || y >= ih - 4)) rim[id]++; }
+      for (const c of comps) {
+        const edgeHug = rim[c.id] / c.a >= 0.8 || c.w <= 3 || c.h <= 3;
+        if (!edgeHug && c.w >= 8 && c.h >= 8 && c.a >= 35) mark = Math.max(mark, c.a);
+      }
+      ink /= iw * ih;
+    }
+    out[k] = Math.round(ink * 1000) / 1000;
+    out[k + 'Mark'] = mark >= 35;
+    out[k + 'Size'] = mark;
+    out[k + 'Located'] = best.confidence >= .55 && sides.confidence >= .55;
   }
   return out;
 }
+/* Ausente e Eliminado seguem a mesma regra:
+   - só são marcados automaticamente quando a caixa foi localizada, há um traço nela e o cartão não tem respostas;
+   - com respostas, a marca vira alerta para conferência (o cartão segue como presente / não eliminado). */
 function flagDecision(fl, ans) {
-  const answered=ans.some(a=>a>=0||a===-2), marked=fl.aus>.03 && fl.ausLocated;
-  const notices=[];
-  if(marked&&answered) notices.push('Há respostas e uma possível marca em Ausente. Mantido como presente: confira a caixa.');
-  if((fl.aus>.03&&!fl.ausLocated)||(fl.eli>.03&&!fl.eliLocated)) notices.push('Não foi possível confirmar a caixa de situação: confira Ausente/Eliminado.');
-  return {aus:marked&&!answered, eli:fl.eli>.03&&fl.eliLocated, flagNotice:notices.join(' ')};
+  const answered = ans.some(a => a >= 0 || a === -2), notices = [];
+  // cartões antigos (sem ausMark) usam a medida anterior, que exigia a caixa localizada
+  const ausM = fl.ausMark ?? (fl.aus > .03 && fl.ausLocated), eliM = fl.eliMark ?? (fl.eli > .03 && fl.eliLocated);
+  if (ausM && answered) notices.push('Há respostas e uma possível marca em Ausente. Mantido como presente: confira a caixa.');
+  if (eliM && answered) notices.push('Há respostas e uma possível marca em Eliminado. Mantido como não eliminado: confira a caixa.');
+  if ((fl.ausMark && fl.ausLocated === false) || (fl.eliMark && fl.eliLocated === false)) notices.push('Não foi possível confirmar a moldura da caixa de situação: confira Ausente/Eliminado.');
+  if (!answered && !ausM) notices.push('Nenhuma resposta e Ausente não marcado: confira se o candidato faltou.');
+  return { aus: ausM && !answered, eli: eliM && !answered, flagNotice: notices.join(' ') };
 }
 /* fills -> {ans[-1 branco | -2 dupla | 0..4], st['ok','blank','double','weak']} */
 function classify(fills, thr, evidence) {
   thr = thr || { strong: .30, weak: .12 };
-  const ans=[],st=[];
+  const fa=adjFills(fills, evidence), ans=[],st=[], weak=thr.weak;
   for(let q=0;q<fills.length;q++) {
     const f=fills[q], marked=[], faint=[];
     for(let k=0;k<5;k++) {
       const e=evidence?.[q]?.[k];
-      if(f[k]>=thr.weak || hasStroke(e)) marked.push(k);
+      if(fa[q][k]>=weak || hasStroke(e)) marked.push(k);
     }
     // Uma marca secundária não precisa estar totalmente preenchida para zerar a questão.
     if(marked.length>=2){ans.push(-2);st.push('double');}
@@ -1172,7 +1319,7 @@ function markerLineCandidates(src, sw, sh) {
     if (Math.abs(A.d / B.d - 1) > 0.09) continue;
     const pitch = (A.d + B.d) / 2, vx = -A.uy, vy = A.ux;                    // vy,vx: perpendicular
     const sep = (B.cx - A.cx) * vx + (B.cy - A.cy) * vy;
-    if (Math.abs(Math.abs(sep) / pitch - 606 / 40.85) > 3.0) continue;         // 14,85 passos entre as colunas
+    if (Math.abs(Math.abs(sep) / pitch - (CARD.rx - CARD.lx) / CARD.lp) > 3.0) continue;   // passos entre as colunas
     if (Math.abs((B.cx - A.cx) * A.ux + (B.cy - A.cy) * A.uy) > 3.2 * pitch) continue;
     for (const sg of [1, -1]) {
       const yx = sg * A.ux, yy = sg * A.uy, xx = yy, xy = -yx;                 // eixo x do cartão = y girado
@@ -1219,6 +1366,62 @@ const OCRREAL=[["A",0.938,[0,0,0,0,0,0.018,0.055,0.055,0.055,0.055,0.055,0.08,0.
    Fonte impressa conhecida (Calibri Negrito): segmenta letra por letra e compara com modelos.
    Faixa analisada, em pixels canônicos: HDR. Recebe a faixa em cinza na escala s. */
 const HDR = { x0: 64, y0: 196, x1: 1172, y1: 268 };
+/* ---------- Modelos do cartão (pixels canônicos: A4 a 150 dpi) ----------
+   2027: letras A–E impressas dentro dos balões; grade mais baixa; quadrados numerados pretos;
+         faixa do nome com fundo cinza; "Total de acertos" mais abaixo.
+   2026: modelo anterior, mantido para PDFs antigos.
+   letter: retângulo da letra dentro do balão (relativo ao canto superior esquerdo do balão),
+           já com folga de 3 px. Esses pixels não contam como marcação nem como rasura. */
+const CARD_MODELS = {
+  '2027': { label: 'ENA 2027 — letras dentro dos balões',
+    lx: 77, ly: 857, lp: 41.714, lw: 51, rx: 682, ry: 857, rp: 41.714, rw: 51,
+    box: { dx: 74, step: 76.75, w: 53.5, h: 25 }, letter: { x0: 15, x1: 31, y0: 1, y1: 19 },
+    glyphs: {"ox":12,"oy":3,"w":24,"h":16,"bits":["000000000000000000000000000000000000000000000000000000000011110000000000000000000011110000000000000000000011110000000000000000000111111000000000000000000110111000000000000000001110011000000000000000001110011100000000000000001111111100000000000000011111111100000000000000011100001110000000000000011000001110000000000000111000000110000000000000000000000000000000000000000000000000000000","000000000000000000000000000000000000000000000000000000001111110000000000000000011111111000000000000000011100011000000000000000011100011000000000000000011100111000000000000000011111110000000000000000011111111000000000000000011100011100000000000000011100011100000000000000011100011100000000000000011111111000000000000000001111110000000000000000000000000000000000000000000000000000000000","000000000000000000000000000000000000000000000000000000000011111100000000000000000111111110000000000000001110000100000000000000011110000000000000000000011110000000000000000000011110000000000000000000011110000000000000000000011110000000000000000000001110000000000000000000001111000110000000000000000111111100000000000000000011111000000000000000000000000000000000000000000000000000000000","000000000000000000000000000000000000000000000000000000011111110000000000000000011111111000000000000000011100011100000000000000011100001110000000000000011100001110000000000000011100000110000000000000011100000110000000000000011100001110000000000000011100001110000000000000011100011100000000000000011111111100000000000000011111110000000000000000000000000000000000000000000000000000000000","000000000000000000000000000000000000000000000000000000001111111000000000000000001111111000000000000000001110000000000000000000001110000000000000000000001110000000000000000000001111111000000000000000001111111000000000000000001110000000000000000000001110000000000000000000001110000000000000000000001111111000000000000000001111111000000000000000000000000000000000000000000000000000000000"]},
+    flag: { aus: { x: 51, y: 279, w: 87, h: 52 }, eli: { x: 1068, y: 279, w: 87, h: 52 } },
+    hdr: { x0: 50, y0: 202, x1: 1158, y1: 274 }, nameRange: [50, 880], cpfRange: [860, 1158],
+    strip: { name: [52, 212, 600, 52], cpf: [860, 212, 300, 52] }, total: { x: 920, y: 1586 } }
+};
+let CARD = CARD_MODELS['2027'];
+function applyCardModel(id) {
+  const m = CARD = CARD_MODELS[id] || CARD_MODELS['2027'];
+  buildGlyphs();
+  TPL.length = 0;
+  for (let q = 0; q < NQ; q++) { const i = q % 15; TPL.push(q < 15 ? { x: m.lx, y: m.ly + i * m.lp, w: m.lw, h: 25 } : { x: m.rx, y: m.ry + i * m.rp, w: m.rw, h: 25 }); }
+  BOX_DX = m.box.dx; BOX_STEP = m.box.step; BOX_W = m.box.w; BOX_H = m.box.h;
+  Object.assign(FLAGBOX.aus, m.flag.aus); Object.assign(FLAGBOX.eli, m.flag.eli); Object.assign(HDR, m.hdr);
+}
+/* Verificação da letra impressa (modelo com letras nos balões).
+   Em vez de ler a letra com OCR, o app sabe qual letra deve estar em cada balão e qual é o seu
+   desenho exato (extraído do cartão vazio). Em cada balão ele encaixa esse desenho (±2 px) onde
+   ele melhor coincide com a tinta e descarta só os pixels da letra (com 1 px de folga).
+   Todo o resto, inclusive tinta por cima ou em volta da letra, conta como marcação. */
+const GLYPH_PAD = 1;
+let GLYPHS = null;
+function buildGlyphs() {
+  const G = CARD.glyphs; if (!G) { GLYPHS = null; return; }
+  GLYPHS = G.bits.map(bits => {
+    const m = Uint8Array.from(bits, ch => ch === '1'), d = new Uint8Array(G.w * G.h), pts = [];
+    for (let y = 0; y < G.h; y++) for (let x = 0; x < G.w; x++) if (m[y * G.w + x]) {
+      pts.push([x, y]);
+      for (let dy = -GLYPH_PAD; dy <= GLYPH_PAD; dy++) for (let dx = -GLYPH_PAD; dx <= GLYPH_PAD; dx++) { const yy = y + dy, xx = x + dx; if (yy >= 0 && yy < G.h && xx >= 0 && xx < G.w) d[yy * G.w + xx] = 1; }
+    }
+    return { pts, d };
+  });
+}
+/* devolve uma função (x,y) => true se o pixel pertence à letra impressa do balão k */
+function letterTest(gray, r, k, T) {
+  if (!GLYPHS) return null;
+  const G = CARD.glyphs, g = GLYPHS[k], bx = Math.round(r.x) + G.ox, by = Math.round(r.y) + G.oy;
+  let best = -1, sx = 0, sy = 0;
+  for (let dy = -2; dy <= 2; dy++) for (let dx = -2; dx <= 2; dx++) {
+    let s = 0; for (const [x, y] of g.pts) if (gray[(by + y + dy) * CW + bx + x + dx] < T) s++;
+    s -= 0.01 * (Math.abs(dx) + Math.abs(dy));
+    if (s > best) { best = s; sx = dx; sy = dy; }
+  }
+  const x0 = bx + sx, y0 = by + sy;
+  return (x, y) => { const i = x - x0, j = y - y0; return i >= 0 && j >= 0 && i < G.w && j < G.h && g.d[j * G.w + i] === 1; };
+}
+buildGlyphs(); applyCardModel('2027');
 const OFH = 24, OFW = 34, AFS = 10;
 const _b64 = s => (typeof atob === 'function') ? Uint8Array.from(atob(s), c => c.charCodeAt(0)) : new Uint8Array(Buffer.from(s, 'base64'));
 function _unpack(b64, n) { const by = _b64(b64), o = new Float32Array(n); for (let i = 0; i < n; i++) o[i] = (by[i >> 3] >> (7 - (i & 7))) & 1; return o; }
@@ -1487,7 +1690,7 @@ function toast(msg, ms = 2400) { const t = $('#toast'); t.textContent = msg; t.c
 const DEFAULT_GAB = 'DCAECEABAABDBDCAACCEBDEEECDBDB'.split('').map(c => LET.indexOf(c));
 const SENS = { rig: { strong: .42, weak: .18 }, nor: { strong: .30, weak: .12 }, sen: { strong: .20, weak: .08 } };
 const S = {
-  cards: [], gab: DEFAULT_GAB.slice(), cfg: { exam: 'ENA 2027', max: 30, sens: 'nor', ocr: 'tesseract' },
+  cards: [], gab: DEFAULT_GAB.slice(), cfg: { exam: 'ENA 2027', max: 30, sens: 'nor', ocr: 'tesseract', model: '2027' },
   tab: 'list', filter: 'all', q: '', openId: null, memOnly: false, gabFrom: 'ENA 2027 — conferir alternativas'
 };
 const thr = () => SENS[S.cfg.sens] || SENS.nor;
@@ -1608,7 +1811,7 @@ function headerFromCanvas(cv) {
 }
 /* Contraste, remoção da moldura e margem branca; preserva os acentos. */
 function ocrField(header, field, variant = 0) {
-  const s = header.w / (HDR.x1 - HDR.x0), range = field === 'name' ? [64, 902] : [908, 1172];
+  const s = header.w / (HDR.x1 - HDR.x0), range = field === 'name' ? CARD.nameRange : [CARD.cpfRange[0] + 48, CARD.cpfRange[1]];
   const left = Math.max(0, Math.round((range[0] - HDR.x0) * s)), right = Math.min(header.w, Math.round((range[1] - HDR.x0) * s));
   const w = right - left, h = header.h, g = new Uint8Array(w * h), hist = new Uint32Array(256);
   for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) { const v = header.gray[y * header.w + left + x]; g[y * w + x] = v; hist[v]++; }
@@ -1643,7 +1846,7 @@ function _ocrOtsu(g) { const h = new Uint32Array(256); for (let i = 0; i < g.len
   for (let i = 0; i < 256; i++) { wB += h[i]; if (!wB) continue; const wF = n - wB; if (!wF) break; sB += i * h[i]; const mB = sB / wB, mF = (sum - sB) / wF, b = wB * wF * (mB - mF) * (mB - mF); if (b > best) { best = b; t = i; } } return t; }
 const _ocrMed = a => { const b = a.slice().sort((x, y) => x - y); return b[b.length >> 1]; };
 function ocrPrepField(header, field, mode = 'gray') {
-  const s = header.w / (HDR.x1 - HDR.x0), range = field === 'name' ? [64, 902] : [860, 1172];
+  const s = header.w / (HDR.x1 - HDR.x0), range = field === 'name' ? CARD.nameRange : CARD.cpfRange;
   const left = Math.max(0, Math.round((range[0] - HDR.x0) * s)), right = Math.min(header.w, Math.round((range[1] - HDR.x0) * s));
   const w = right - left, h = header.h, g = new Uint8Array(w * h), hist = new Uint32Array(256);
   for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) { const v = header.gray[y * header.w + left + x]; g[y * w + x] = v; hist[v]++; }
@@ -1833,6 +2036,51 @@ async function rereadMarks(c) {
 }
 
 /* ================= caixas de diálogo ================= */
+/* Orientações de digitalização: aparecem no primeiro acesso e podem ser reabertas pela página inicial. */
+function showHowTo() {
+  return new Promise(res => {
+    const d = $('#dlg'); d.hidden = false;
+    d.innerHTML = `<div class="busybox" role="dialog" aria-labelledby="htT" style="width:min(92%,520px);max-height:86vh;overflow:auto">
+      <h2 id="htT" style="margin:0 0 8px;font-size:18px">Como funciona a correção</h2>
+      <ol style="margin:0 0 12px;padding-left:20px;line-height:1.45">
+        <li>Confira o gabarito na aba Gabarito.</li>
+        <li>Se tiver, carregue a lista de inscritos (.xlsx com nome e CPF). Ela ajuda a confirmar nome e CPF.</li>
+        <li>Carregue o PDF. O app lê as marcações, o nome e o CPF e calcula a nota.</li>
+        <li>Abra os cartões com a etiqueta "Revisar", corrija o que for preciso e toque em "Marcar revisado".</li>
+        <li>Exporte a planilha e o PDF anotado na aba Exportar.</li>
+      </ol>
+      <p style="margin:0 0 6px"><b>O que pede revisão</b></p>
+      <ul style="margin:0 0 12px;padding-left:20px;line-height:1.45">
+        <li><b>Dupla marcação:</b> duas alternativas marcadas ou rasura em outra. A questão vale zero. Se for engano de leitura, toque na letra certa.</li>
+        <li><b>Marcação fraca:</b> preenchimento incompleto. Confira a alternativa lida.</li>
+        <li><b>Nome ou CPF com dúvida:</b> corrija pelo recorte do cartão.</li>
+        <li><b>Lista de inscritos:</b> CPF corrigido pela lista ou fora dela. Confira com o recorte.</li>
+        <li><b>Ausente ou Eliminado:</b> confira a caixa e use os botões, se for o caso.</li>
+      </ul>
+      <p style="margin:0 0 14px">Os cartões ficam salvos só neste navegador. Exporte antes de limpar o navegador.</p>
+      <div class="row" style="justify-content:flex-end"><button class="btn pri" data-r="1">Entendi</button></div></div>`;
+    d.onclick = e => { const b = e.target.closest('[data-r]'); if (!b) return; d.hidden = true; d.innerHTML = ''; res(true); };
+    setTimeout(() => { const b = d.querySelector('[data-r]'); if (b) b.focus({ preventScroll: true }); }, 0);
+  });
+}
+function showScanGuide() {
+  return new Promise(res => {
+    const d = $('#dlg'); d.hidden = false;
+    d.innerHTML = `<div class="busybox" role="dialog" aria-labelledby="sgT" style="width:min(92%,520px);max-height:86vh;overflow:auto">
+      <h2 id="sgT" style="margin:0 0 8px;font-size:18px">Antes de enviar os cartões</h2>
+      <p style="margin:0 0 10px">A correção automática é tão boa quanto a digitalização. Cartões nítidos, retos e inteiros geram resultados confiáveis. Imagens borradas, tortas, cortadas ou comprimidas geram alertas e podem levar a leituras erradas.</p>
+      <ul style="margin:0 0 12px;padding-left:20px;line-height:1.45">
+        <li><b>Use scanner</b> (de mesa ou de impressora multifuncional). PDFs montados a partir de fotos de celular, como os do CamScanner e aplicativos semelhantes, podem causar erros inesperados.</li>
+        <li><b>Digitalize com pelo menos 200 dpi</b>, com a folha inteira na imagem.</li>
+        <li><b>Use tamanho real (100%)</b>: cada página do PDF deve ser uma cópia 1:1 do cartão impresso. Não use opções como "ajustar à página", "reduzir" ou "várias páginas por folha", que deixam o cartão menor, dentro de outra folha A4.</li>
+        <li><b>Envie o PDF como saiu do scanner.</b> Não use compressores como iLovePDF, SmallPDF e similares: eles reduzem a resolução das imagens.</li>
+      </ul>
+      <p style="margin:0 0 14px">PDFs com páginas em baixa resolução serão recusados.</p>
+      <div class="row" style="justify-content:flex-end"><button class="btn pri" data-r="1">Entendi</button></div></div>`;
+    d.onclick = e => { const b = e.target.closest('[data-r]'); if (!b) return; d.hidden = true; d.innerHTML = ''; res(true); };
+    setTimeout(() => { const b = d.querySelector('[data-r]'); if (b) b.focus(); }, 0);
+  });
+}
 function ask(msg, okLabel = 'Confirmar', danger = false, cancelLabel = 'Cancelar') {
   return new Promise(res => {
     const d = $('#dlg'); d.hidden = false;
@@ -1852,6 +2100,106 @@ const Busy = {
 /* ================= regras do cartão ================= */
 const isDouble = (c, q) => c.ans[q] === -2 || c.st[q] === 'double';
 const cardScore = c => score(c.ans, S.gab, c.st);
+/* ================= Lista de inscritos (.xlsx/.csv com nome e CPF) =================
+   O CPF é o campo mais confiável da leitura (tem dígito verificador). Cada cartão é cruzado com a lista:
+   1) procura o CPF lido; se não houver igual, o mais próximo com até 1 dígito de diferença
+      (2, se o nome confirmar com folga), sem empate;
+   2) confere o nome lido com o da lista.
+   Sempre que encontra um inscrito correspondente, o app aplica nome e CPF da lista automaticamente;
+   o usuário revisa e, se estiver errado, reverte para o que foi lido no cartão.
+   Os alertas de leitura de nome e CPF continuam valendo: a lista só acrescenta informação e avisos. */
+const ROSTER = { list: null, file: '', byCpf: new Map() };
+const normName = s => (s || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toUpperCase().replace(/[^A-Z ]/g, ' ').replace(/\s+/g, ' ').trim();
+function lev(a, b) {
+  const m = a.length, n = b.length; if (!m) return n; if (!n) return m;
+  let prev = Array.from({ length: n + 1 }, (_, j) => j), cur = new Array(n + 1);
+  for (let i = 1; i <= m; i++) { cur[0] = i; for (let j = 1; j <= n; j++) cur[j] = Math.min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1)); [prev, cur] = [cur, prev]; }
+  return prev[n];
+}
+function nameSim(a, b) { a = normName(a); b = normName(b); if (!a || !b) return 0; return 1 - lev(a, b) / Math.max(a.length, b.length); }
+function setRoster(r) {
+  ROSTER.list = r ? r.list : null; ROSTER.file = r ? r.file : ''; ROSTER.byCpf = new Map();
+  if (ROSTER.list) for (const e of ROSTER.list) ROSTER.byCpf.set(e.cpf, e);
+}
+async function readRoster(file) {
+  await loadLib('xlsx');
+  const wb = XLSX.read(await file.arrayBuffer(), { type: 'array' });
+  const cpfOf = v => { if (typeof v === 'number') return String(Math.round(v)).padStart(11, '0'); let d = String(v || '').replace(/\D/g, ''); if (d.length >= 9 && d.length < 11) d = d.padStart(11, '0'); return d; };
+  let best = null;
+  for (const sn of wb.SheetNames) {
+    const rows = XLSX.utils.sheet_to_json(wb.Sheets[sn], { header: 1, raw: true, defval: '' }).filter(r => r.some(v => String(v).trim()));
+    if (!rows.length) continue;
+    // cabeçalho com "CPF" e "Nome" nas primeiras linhas; senão, descobre as colunas pelo conteúdo
+    let hr = -1, cc = -1, nc = -1;
+    for (let i = 0; i < Math.min(15, rows.length) && hr < 0; i++) {
+      const h = rows[i].map(v => normName(String(v)));
+      const c1 = h.findIndex(v => /\bCPF\b/.test(v)), n1 = h.findIndex(v => /\bNOME\b|CANDIDAT|INSCRIT/.test(v) && !/\bCPF\b/.test(v));
+      if (c1 >= 0 && n1 >= 0) { hr = i; cc = c1; nc = n1; }
+    }
+    if (hr < 0) {
+      const ncol = Math.max(...rows.map(r => r.length)), score = (k, f) => rows.reduce((s, r) => s + (f(r[k]) ? 1 : 0), 0);
+      let bc = -1, bn = -1, sc = 0, sn2 = 0;
+      for (let k = 0; k < ncol; k++) {
+        const s1 = score(k, v => cpfValido(cpfOf(v))), s2 = score(k, v => typeof v === 'string' && /[A-Za-zÀ-ÿ]{2,}\s+[A-Za-zÀ-ÿ]{2,}/.test(v));
+        if (s1 > sc) { sc = s1; bc = k; } if (s2 > sn2) { sn2 = s2; bn = k; }
+      }
+      cc = bc; nc = bn; hr = -1;
+    }
+    if (cc < 0 || nc < 0) continue;
+    const list = [], bad = [];
+    for (let i = hr + 1; i < rows.length; i++) {
+      const cpf = cpfOf(rows[i][cc]), nome = String(rows[i][nc] || '').replace(/\s+/g, ' ').trim();
+      if (!cpf && !nome) continue;
+      if (cpf.length === 11 && cpfValido(cpf) && nome) list.push({ nome, cpf }); else bad.push(i + 1);
+    }
+    if (!best || list.length > best.list.length) best = { list, bad, sheet: sn };
+  }
+  if (!best || !best.list.length) throw new Error('Não encontrei colunas de nome e CPF válidos neste arquivo.');
+  return { file: file.name, list: best.list, bad: best.bad, sheet: best.sheet };
+}
+function matchRoster(cpfRead, nameRead) {
+  if (!ROSTER.list) return null;
+  const d = (cpfRead || '').replace(/\D/g, '');
+  if (d.length >= 9) {
+    const ex = ROSTER.byCpf.get(d);
+    if (ex) { const sim = nameSim(nameRead, ex.nome); return { status: sim >= 0.75 || !normName(nameRead) ? 'exato' : 'nome-difere', e: ex, dist: 0, sim }; }
+    const near = []; for (const e of ROSTER.list) { const k = lev(d, e.cpf); if (k <= 2) near.push({ e, dist: k }); }
+    if (near.length) {
+      const dmin = Math.min(...near.map(x => x.dist)), ties = near.filter(x => x.dist === dmin).map(x => ({ ...x, sim: nameSim(nameRead, x.e.nome) })).sort((a, b) => b.sim - a.sim);
+      const top = ties[0], second = ties[1], need = dmin === 1 ? 0.6 : 0.8;
+      if (top.sim >= need && (!second || top.sim - second.sim >= 0.15)) return { status: 'corrigido', e: top.e, dist: dmin, sim: top.sim };
+      return { status: 'ambiguo', e: top.e, dist: dmin, sim: top.sim };
+    }
+  }
+  // CPF ilegível ou fora da lista: só aceita o nome se for praticamente igual e único
+  if (normName(nameRead)) {
+    const s = ROSTER.list.map(e => ({ e, sim: nameSim(nameRead, e.nome) })).sort((a, b) => b.sim - a.sim);
+    if (s[0] && s[0].sim >= 0.9 && (!s[1] || s[0].sim - s[1].sim >= 0.1)) return { status: 'por-nome', e: s[0].e, sim: s[0].sim };
+  }
+  return { status: 'nao-encontrado' };
+}
+/* cruza um cartão com a lista. Guarda a leitura original e não mexe em nome/CPF editados à mão. */
+function applyRoster(c) {
+  if (c.ocrCpf === undefined) { c.ocrCpf = c.cpf || ''; c.ocrName = c.name || ''; }
+  if (!ROSTER.list) { c.roster = null; if (!c.idManual) { c.cpf = c.ocrCpf; c.name = c.ocrName; } return; }
+  const manual = !!c.idManual, m = manual ? matchRoster(c.cpf, c.name) : matchRoster(c.ocrCpf, c.ocrName);
+  c.roster = { status: m.status, nome: m.e ? m.e.nome : '', cpf: m.e ? m.e.cpf : '', dist: m.dist || 0, sim: m.sim != null ? Math.round(m.sim * 100) / 100 : null, applied: false };
+  if (manual) return;
+  c.cpf = c.ocrCpf; c.name = c.ocrName;
+  if (m.e) { c.cpf = fmtCpf(m.e.cpf); c.name = m.e.nome.toUpperCase(); c.roster.applied = true; }   // aplica sempre; o usuário revisa
+}
+const ROSTER_TXT = { exato: 'Confere com a lista', corrigido: 'CPF corrigido pela lista', 'nome-difere': 'Nome substituído pelo da lista', 'por-nome': 'Identificado pelo nome', ambiguo: 'Inscrito mais provável aplicado', 'nao-encontrado': 'Não está na lista' };
+function rosterAlert(c) {
+  const r = c.roster; if (!r || !ROSTER.list) return '';
+  if (r.status === 'nao-encontrado') return 'CPF não está na lista de inscritos';
+  if (r.status === 'exato') return '';
+  if (!r.applied) return 'Nome ou CPF diferentes da lista de inscritos: confira';
+  if (r.status === 'corrigido') return `CPF corrigido pela lista de inscritos (${r.dist} dígito${r.dist > 1 ? 's' : ''} diferente${r.dist > 1 ? 's' : ''}): confira`;
+  if (r.status === 'nome-difere') return 'Nome substituído pelo da lista (o lido no cartão era diferente): confira';
+  if (r.status === 'por-nome') return 'CPF não encontrado; inscrito identificado pelo nome e CPF preenchido pela lista: confira';
+  if (r.status === 'ambiguo') return 'CPF parecido com mais de um inscrito; foi usado o mais provável: confira';
+  return '';
+}
 function alertsOf(c) {
   const a = [];
   const d = c.ans.map((_, i) => isDouble(c, i) ? i + 1 : 0).filter(Boolean);
@@ -1863,6 +2211,7 @@ function alertsOf(c) {
   if (c.cpfLow) a.push('Leitura do CPF com dúvida: confira na imagem');
   if (c.ocrNotice) a.push(c.ocrNotice);
   if (c.flagNotice) a.push(c.flagNotice);
+  const ra = rosterAlert(c); if (ra) a.push(ra);
   if (!cpfValido(c.cpf)) a.push(c.cpf ? 'CPF inválido' : 'Sem CPF');
   return a;
 }
@@ -1974,6 +2323,33 @@ function nameCpfFromItems(items) {
 }
 
 /* ================= importar PDF em lote ================= */
+/* Resolução da digitalização.
+   O que importa é quantos pixels da imagem ORIGINAL cobrem cada polegada do cartão — não o tamanho de
+   página declarado no PDF nem a resolução em que o app renderiza (ampliar não recupera detalhe).
+   pageImagePPI: pixels por polegada da maior imagem da página, seguindo a matriz de transformação do PDF.
+   Depois de localizar o cartão, converte para pixels por polegada do próprio cartão (A4). */
+const DPI_MIN = 150, DPI_PEDIDO = 200;   // recusa abaixo de ~150 (com 5% de margem), mas orienta a digitalizar com 200
+async function pageImagePPI(page) {
+  const ops = await page.getOperatorList(), O = pdfjsLib.OPS;
+  const mul = (m, n) => [m[0] * n[0] + m[2] * n[1], m[1] * n[0] + m[3] * n[1], m[0] * n[2] + m[2] * n[3], m[1] * n[2] + m[3] * n[3], m[0] * n[4] + m[2] * n[5] + m[4], m[1] * n[4] + m[3] * n[5] + m[5]];
+  let ctm = [1, 0, 0, 1, 0, 0]; const stack = [], imgs = [];
+  for (let i = 0; i < ops.fnArray.length; i++) {
+    const fn = ops.fnArray[i], a = ops.argsArray[i];
+    if (fn === O.save) stack.push(ctm);
+    else if (fn === O.restore) ctm = stack.pop() || [1, 0, 0, 1, 0, 0];
+    else if (fn === O.transform) ctm = mul(ctm, a);
+    else if (fn === O.paintImageXObject || fn === O.paintInlineImageXObject) {
+      const w = fn === O.paintImageXObject ? a[1] : a[0] && a[0].width, h = fn === O.paintImageXObject ? a[2] : a[0] && a[0].height;
+      const dw = Math.hypot(ctm[0], ctm[1]) / 72, dh = Math.hypot(ctm[2], ctm[3]) / 72;   // tamanho exibido, em polegadas
+      if (!w || !h || !dw || !dh) continue;
+      imgs.push({ area: dw * dh, ppi: Math.min(w / dw, h / dh) });
+    }
+  }
+  if (!imgs.length) return null;   // página sem imagem (PDF vetorial): sem limite
+  // alguns scanners sobrepõem duas imagens da página inteira (base + camada de detalhe): vale a de maior resolução
+  const maxA = Math.max(...imgs.map(i => i.area));
+  return Math.max(...imgs.filter(i => i.area >= 0.5 * maxA).map(i => i.ppi));
+}
 async function importPdfs(files) {
   files = [...files]; if (!files.length) return;
   Busy.show('Lendo cartões do PDF'); Busy.set('Carregando o leitor de PDF…', 0);
@@ -1984,10 +2360,29 @@ async function importPdfs(files) {
     try { const pdf = await pdfjsLib.getDocument({ data: await f.arrayBuffer() }).promise; docs.push({ f, pdf }); tot += pdf.numPages; }
     catch (e) { fails.push(f.name + ': arquivo ilegível'); }
   }
+  /* Um PDF com qualquer página em baixa resolução é recusado por inteiro.
+     1) Checagem rápida de todas as páginas (resolução das imagens) antes de ler qualquer cartão.
+     2) Durante a leitura, a medida exata no cartão; os cartões do arquivo só são gravados no fim,
+        se nenhuma página ficou abaixo do mínimo. */
+  const rejected = [];   // { f, dpis: [] }
   outer: for (const { f, pdf } of docs) {
+    const pages = [], low = [];
+    Busy.set(`${f.name} — conferindo a resolução…`, doneN / tot); await tick();
     for (let p = 1; p <= pdf.numPages; p++) {
       if (Busy.cancel) break outer;
-      Busy.set(`${f.name} — página ${p} de ${pdf.numPages}  (${okN} cartões lidos)`, doneN / tot);
+      try {
+        const page = await pdf.getPage(p), vp0 = page.getViewport({ scale: 1 });
+        let ppi = null; try { ppi = await pageImagePPI(page); } catch (e) { console.warn(e); }
+        const upper = ppi ? ppi * (Math.min(vp0.width, vp0.height) / 72) / 8.27 : null;   // cartão ocupando a página inteira
+        if (upper && upper < DPI_MIN * 0.95) low.push(Math.round(upper));
+        pages.push({ p, ppi });
+      } catch (e) { console.warn(e); pages.push({ p, ppi: null }); }
+    }
+    if (low.length) { rejected.push({ f: f.name, dpis: low }); doneN += pdf.numPages; continue; }
+    const pending = [], fileFails = [];
+    for (const { p, ppi } of pages) {
+      if (Busy.cancel) break;
+      Busy.set(`${f.name} — página ${p} de ${pdf.numPages}  (${okN + pending.length} cartões lidos)`, doneN / tot);
       await tick();
       try {
         const page = await pdf.getPage(p), vp0 = page.getViewport({ scale: 1 });
@@ -1997,21 +2392,27 @@ async function importPdfs(files) {
         let txt = { name: '', cpf: '' };
         try { txt = nameCpfFromItems((await page.getTextContent()).items); } catch (e) { }
         const r = await scanCanvas(cv, 'scan');
-        if (!r.ok) { fails.push(`${f.name}, pág. ${p}: ${r.why}`); }
-        else {
-          const c = await cardFromScan(r, { src: 'pdf', file: f.name, page: p, name: txt.name, cpf: txt.cpf });
-          S.cards.push(c); await saveCard(c); okN++;
-        }
+        // resolução efetiva no cartão: pixels da imagem original por polegada do cartão
+        const dpi = r.ok && ppi ? ppi * Math.sqrt(Math.abs(r.H[0] * r.H[4] - r.H[1] * r.H[3])) * 150 / (72 * sc) : null;
+        if (!r.ok) fileFails.push(`${f.name}, pág. ${p}: ${r.why}`);
+        else if (dpi && dpi < DPI_MIN * 0.95) low.push(Math.round(dpi));
+        else pending.push(await cardFromScan(r, { src: 'pdf', file: f.name, page: p, name: txt.name, cpf: txt.cpf }));
         page.cleanup();
-      } catch (e) { console.warn(e); fails.push(`${f.name}, pág. ${p}: erro`); }
+      } catch (e) { console.warn(e); fileFails.push(`${f.name}, pág. ${p}: erro`); }
       doneN++;
     }
+    if (low.length) { rejected.push({ f: f.name, dpis: low }); continue; }   // descarta o arquivo inteiro
+    for (const c of pending) { applyRoster(c); S.cards.push(c); await saveCard(c); okN++; }
+    fails.push(...fileFails);
   }
   renderList(); renderHeader();
   const noName = S.cards.filter(c => c.src === 'pdf' && (!c.name || !cpfValido(c.cpf))).length;
+  const allLow = rejected.flatMap(x => x.dpis), lo = allLow.length ? Math.min(...allLow) : 0, hi = allLow.length ? Math.max(...allLow) : 0;
+  const lowBox = rejected.length ? `<div class="fail" style="border-left:4px solid var(--bad);color:var(--ink)"><b style="color:var(--bad)">Qualidade da digitalização abaixo do necessário</b><br>
+      Resolução encontrada: ${lo === hi ? `~${lo}` : `~${lo} a ${hi}`} dpi. Digitalize novamente com <b>pelo menos ${DPI_PEDIDO} dpi</b>.</div>` : '';
   Busy.done({
-    msg: `${okN} cartão(ões) lido(s)${Busy.cancel ? ' (interrompido — o que já foi lido está salvo)' : ''}. ` + (fails.length ? `${fails.length} página(s) não reconhecida(s).` : ''),
-    extra: (fails.length ? `<div class="fail">Não reconhecidas:<br>${fails.map(esc).join('<br>')}</div>` : '') +
+    msg: `${okN} cartão(ões) lido(s)${Busy.cancel ? ' (interrompido — o que já foi lido está salvo)' : ''}. ` + (rejected.length ? `${rejected.length} arquivo(s) PDF recusado(s) por inteiro. ` : '') + (fails.length ? `${fails.length} página(s) não reconhecida(s).` : ''),
+    extra: lowBox + (fails.length ? `<div class="fail">Não reconhecidas:<br>${fails.map(esc).join('<br>')}</div>` : '') +
       (noName ? `<p class="note">${noName} cartão(ões) com nome ou CPF que não consegui ler com segurança. Eles aparecem em "Revisar".</p>` : '')
   });
 }
@@ -2062,7 +2463,7 @@ async function annotate(c, scale = 1) {
   }
   const sc = cardScore(c);
   x.textAlign = 'left'; x.textBaseline = 'middle'; x.fillStyle = BADC; x.font = '800 56px system-ui, sans-serif';
-  x.font = c.aus ? '800 44px system-ui, sans-serif' : '800 56px system-ui, sans-serif'; x.fillText(c.aus ? 'AUSENTE' : `${sc} / ${NQ}`, 940, 1488);
+  x.font = c.aus ? '800 44px system-ui, sans-serif' : '800 56px system-ui, sans-serif'; x.fillText(c.aus ? 'AUSENTE' : `${sc} / ${NQ}`, CARD.total.x, CARD.total.y);
   return cv;
 }
 async function showViewer(c) {
@@ -2090,20 +2491,26 @@ const slug = s => (s || 'prova').normalize('NFD').replace(/[\u0300-\u036f]/g, ''
 async function exportXlsx() {
   if (!S.cards.length) return toast('Nenhum cartão ainda');
   try { await loadLib('xlsx'); } catch (e) { return toast(e.message, 4000); }
-  const head = ['Nome', 'CPF', 'Acertos', 'Nota', 'Situação', 'Revisão', 'Alertas'].concat(Array.from({ length: NQ }, (_, i) => 'Q' + (i + 1)));
+  const head = ['Nome', 'CPF', 'Acertos', 'Nota', 'Situação', 'Revisão', 'Alertas', 'Lista de inscritos'].concat(Array.from({ length: NQ }, (_, i) => 'Q' + (i + 1)));
   const rows = [head];
   for (const c of sortedCards()) {
     const sc = cardScore(c);
     rows.push([c.name || '', c.cpf || '', c.aus ? '' : sc, c.aus ? '' : Math.round(sc / NQ * S.cfg.max * 100) / 100,
-      c.aus ? 'Ausente' : c.eli ? 'Eliminado' : 'Presente', c.rev ? 'Revisado' : (alertsOf(c).length ? 'Pendente' : 'Sem alertas'), alertsOf(c).join(' | ')]
+      c.aus ? 'Ausente' : c.eli ? 'Eliminado' : 'Presente', c.rev ? 'Revisado' : (alertsOf(c).length ? 'Pendente' : 'Sem alertas'), alertsOf(c).join(' | '), ROSTER.list && c.roster ? ROSTER_TXT[c.roster.status] : '']
       .concat(c.ans.map((a, q) => isDouble(c, q) ? 'DUPLA (0)' : a >= 0 ? LET[a] : '')));
   }
   const ws = XLSX.utils.aoa_to_sheet(rows);
-  ws['!cols'] = [{ wch: 38 }, { wch: 16 }, { wch: 9 }, { wch: 8 }, { wch: 11 }, { wch: 12 }, { wch: 36 }].concat(Array(NQ).fill({ wch: 12 }));
+  ws['!cols'] = [{ wch: 38 }, { wch: 16 }, { wch: 9 }, { wch: 8 }, { wch: 11 }, { wch: 12 }, { wch: 36 }, { wch: 22 }].concat(Array(NQ).fill({ wch: 12 }));
   for (let r = 1; r < rows.length; r++) { const cell = ws[XLSX.utils.encode_cell({ r, c: 3 })]; if (cell && typeof cell.v === 'number') cell.z = '0.00'; }
   const g = [['Questão', 'Resposta']].concat(S.gab.map((k, i) => [i + 1, k === 5 ? 'ANULADA' : LET[k]]));
   const wg = XLSX.utils.aoa_to_sheet(g); wg['!cols'] = [{ wch: 9 }, { wch: 10 }];
   const wb = XLSX.utils.book_new(); XLSX.utils.book_append_sheet(wb, ws, 'Resultados'); XLSX.utils.book_append_sheet(wb, wg, 'Gabarito');
+  if (ROSTER.list) {   // inscritos da lista sem cartão correspondente (faltou ou não foi digitalizado)
+    const have = new Set(S.cards.map(c => (c.cpf || '').replace(/\D/g, '')));
+    const miss = [['Nome', 'CPF']].concat(ROSTER.list.filter(e => !have.has(e.cpf)).map(e => [e.nome, fmtCpf(e.cpf)]));
+    const wm = XLSX.utils.aoa_to_sheet(miss); wm['!cols'] = [{ wch: 40 }, { wch: 16 }];
+    XLSX.utils.book_append_sheet(wb, wm, 'Inscritos sem cartão');
+  }
   const out = XLSX.write(wb, { bookType: 'xlsx', type: 'array' });
   if (await saveFile(`resultados_${slug(S.cfg.exam)}.xlsx`, new Blob([out], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' }))) toast('Planilha pronta');
 }
@@ -2138,9 +2545,16 @@ function renderList() {
   const el = $('#v-list'), all = S.cards, vis = visibleCards();
   const rev = all.filter(needsReview).length, sc = all.filter(c => !c.aus).map(cardScore);
   const avg = sc.length ? sc.reduce((a, b) => a + b, 0) / sc.length : 0;
-  let h = `<div class="row list-actions" style="margin:6px 0 4px"><button class="btn pri grow" data-act="pdf">Carregar PDF de cartões</button><button class="btn" data-act="img">Fotos</button><button class="btn dng" data-act="wipe" ${all.length ? '' : 'disabled'}>Apagar tudo</button></div>`;
+  let h = `<div class="row list-actions" style="margin:6px 0 4px"><button class="btn pri grow" data-act="pdf">Carregar PDF de cartões</button><button class="btn dng" data-act="wipe" ${all.length ? '' : 'disabled'}>Apagar tudo</button></div>`;
+  {
+    const withR = all.filter(c => c.roster), okR = withR.filter(c => c.roster.status === 'exato').length;
+    h += ROSTER.list
+      ? `<div class="row" style="gap:8px;margin:0 0 8px;align-items:center;font-size:13.5px"><span class="grow"><b>Lista de inscritos:</b> ${esc(ROSTER.file)} · ${ROSTER.list.length} inscritos${withR.length ? ` · ${okR} de ${withR.length} cartões conferem` : ''}</span><button class="fchip" data-act="roster">Trocar</button><button class="fchip" data-act="noroster">Remover</button></div>`
+      : `<div class="row" style="margin:0 0 8px"><button class="btn grow" data-act="roster">Carregar lista de inscritos (.xlsx) — opcional</button></div>`;
+  }
+  h += `<div class="row" style="gap:6px;margin:0 0 8px"><button class="fchip" data-act="guia">Orientações de digitalização</button><button class="fchip" data-act="uso">Como funciona a correção</button></div>`;
   if (!all.length) {
-    h += `<div class="empty"><b>Nenhum cartão corrigido ainda</b>Carregue um PDF com os cartões digitalizados ou abra a aba Câmera. Tudo fica gravado neste aparelho, então você pode corrigir aos poucos.</div>`;
+    h += `<div class="empty"><b>Nenhum cartão corrigido ainda</b>Carregue um PDF com os cartões digitalizados em scanner (200 a 300 dpi).</div>`;
   } else {
     h += `<div class="sum"><div><b>${all.length}</b><span>${all.length === 1 ? 'cartão' : 'cartões'}</span></div><div><b>${rev}</b><span>para revisar</span></div><div><b>${fmtNum(avg)}</b><span>média de acertos</span></div></div>
     <input class="txt" id="qBox" type="search" placeholder="Buscar por nome ou CPF" value="${esc(S.q)}">
@@ -2216,7 +2630,11 @@ function cropStyle(c, x, y, w, h) {
   return `aspect-ratio:${w}/${h};background-image:url(${urlOf(c, 'img')});background-size:${CW / w * 100}% auto;background-position:${px}% ${py}%`;
 }
 function stripHtml(c) {
-  return `<div class="fld"><label>Como está impresso no cartão</label><div class="crop" style="${cropStyle(c, 60, 203, 580, 56)}"></div><div class="crop" style="${cropStyle(c, 880, 203, 320, 56)};margin-top:-2px"></div></div>`;
+  // nome e CPF lado a lado, na mesma escala: a largura de cada um é proporcional ao trecho recortado do cartão
+  const n = CARD.strip.name, p = CARD.strip.cpf;
+  return `<div class="fld"><label>Como está impresso no cartão</label><div style="display:flex;gap:6px;align-items:flex-start;max-width:760px">
+    <div class="crop" style="${cropStyle(c, ...n)};flex:${n[2]} 1 0;width:auto;min-width:0;max-width:none;margin:2px 0 6px"></div>
+    <div class="crop" style="${cropStyle(c, ...p)};flex:${p[2]} 1 0;width:auto;min-width:0;max-width:none;margin:2px 0 6px"></div></div></div>`;
 }
 function drawSheet(c) {
   const sh = $('#sheet'), ids = (S.sheetOpts && S.sheetOpts.fresh) ? [] : visibleCards().map(x => x.id), pos = ids.indexOf(c.id);
@@ -2229,8 +2647,8 @@ function drawSheet(c) {
     <div class="row" style="margin-bottom:8px"><button class="btn" data-sh="view">Ver cartão anotado</button></div>
     <div id="alerts"></div>
     ${stripHtml(c)}
-    <div class="row" style="margin:8px 0"><button class="btn" data-sh="ocr">Reler nome/CPF com OCR</button></div>
-    <div class="note" id="ocrInfo" role="status">${c.ocrEngine === 'texto' ? 'Dados extraídos do texto do PDF.' : c.ocrEngine === 'local' ? 'Leitura pelo OCR local. Você pode reler com o Tesseract.' : 'Leitura por ' + esc(ocrEngineLabel(c.ocrEngine)) + '. ' + (c.nameLow || c.cpfLow ? 'Há dúvida em algum campo: confira na imagem.' : 'Confira os dados na imagem.')}</div>
+    <div id="rosterBox"></div>
+    <div class="note" id="ocrInfo" role="status">${c.ocrEngine === 'texto' ? 'Dados extraídos do texto do PDF.' : c.ocrEngine === 'local' ? 'Leitura pelo OCR local. Confira os dados na imagem.' : 'Leitura por ' + esc(ocrEngineLabel(c.ocrEngine)) + '. ' + (c.nameLow || c.cpfLow ? 'Há dúvida em algum campo: confira na imagem.' : 'Confira os dados na imagem.')}</div>
     <div class="fld"><label for="fName">Nome${c.nameSrc === 'ocr' ? ' (lido automaticamente)' : ''}</label><input class="txt" id="fName" autocomplete="off" autocapitalize="characters" value="${esc(c.name)}"></div>
     <div class="fld"><label for="fCpf">CPF</label><input class="txt" id="fCpf" inputmode="numeric" autocomplete="off" value="${esc(fmtCpf(c.cpf))}"><div class="cpfmsg" id="cpfMsg"></div></div>
     <div class="tog"><button class="btn ${c.aus ? 'on' : ''}" data-sh="aus">Ausente</button><button class="btn ${c.eli ? 'on' : ''}" data-sh="eli">Eliminado</button></div>
@@ -2242,8 +2660,8 @@ function drawSheet(c) {
   </div></div></div>
   <div class="ovfoot">${fromCam ? `<button class="btn" data-sh="del">Descartar</button><button class="btn pri" data-sh="camnext">Salvar e próximo cartão</button>` :
       `<button class="btn dng" data-sh="del">Excluir</button><button class="btn pri" data-sh="okrev">${c.rev ? 'Revisado ✓' : 'Marcar revisado'}</button>`}</div>`;
-  $('#fName').oninput = e => { c.name = e.target.value.toUpperCase(); c.nameLow = false; e.target.value = c.name; saveSoon(c); refreshMeta(c); };
-  $('#fCpf').oninput = e => { c.cpfLow = false; c.cpf = fmtCpf(e.target.value); e.target.value = c.cpf; saveSoon(c); refreshMeta(c); };
+  $('#fName').oninput = e => { c.idManual = true; c.name = e.target.value.toUpperCase(); c.nameLow = false; if (ROSTER.list) applyRoster(c); e.target.value = c.name; saveSoon(c); refreshMeta(c); };
+  $('#fCpf').oninput = e => { c.idManual = true; c.cpfLow = false; c.cpf = fmtCpf(e.target.value); if (ROSTER.list) applyRoster(c); e.target.value = c.cpf; saveSoon(c); refreshMeta(c); };
   refreshMeta(c); applyOnly(); pvSoon(c);
 }
 function refreshMeta(c) {
@@ -2254,6 +2672,23 @@ function refreshMeta(c) {
   else if (d.length < 11) { m.textContent = `Faltam ${11 - d.length} dígito(s)`; m.style.color = 'var(--mut)'; }
   else if (!cpfValido(d)) { m.textContent = 'Dígitos verificadores não conferem: confira o CPF na foto'; m.style.color = 'var(--bad)'; }
   else { m.textContent = 'CPF válido' + (dp ? ` — mas já existe em "${dp.name || 'outro cartão'}"` : ''); m.style.color = dp ? 'var(--bad)' : 'var(--ok)'; }
+  const rb = $('#rosterBox');
+  if (rb) {
+    const r = c.roster;
+    if (!ROSTER.list || !r) rb.innerHTML = '';
+    else {
+      const okk = r.status === 'exato', col = okk ? 'var(--ok)' : 'var(--warn)';
+      const differs = r.cpf && (normName(r.nome) !== normName(c.name) || r.cpf !== (c.cpf || '').replace(/\D/g, ''));
+      const fromCard = c.ocrCpf !== undefined && (normName(c.ocrName) !== normName(c.name) || (c.ocrCpf || '').replace(/\D/g, '') !== (c.cpf || '').replace(/\D/g, ''));
+      const label = !r.applied && differs ? 'Dados do cartão mantidos (diferentes da lista)' : (ROSTER_TXT[r.status] || '');
+      rb.innerHTML = `<div class="fld" style="border-left:3px solid ${col};padding:6px 10px;background:var(--surf2);border-radius:8px">
+        <div style="font-size:12.5px;color:var(--mut)">Lista de inscritos</div>
+        <div style="font-weight:600;color:${col}">${esc(label)}${r.status === 'corrigido' && r.applied ? ` (${r.dist} dígito${r.dist > 1 ? 's' : ''})` : ''}</div>
+        ${r.cpf ? `<div style="font-size:13.5px">${esc(r.nome)} — ${esc(fmtCpf(r.cpf))}</div>` : ''}
+        ${c.ocrCpf !== undefined && (c.ocrCpf || c.ocrName) ? `<div style="font-size:12.5px;color:var(--mut)">Lido no cartão: ${esc(c.ocrName || '—')} — ${esc(c.ocrCpf || '—')}</div>` : ''}
+        <div class="row" style="gap:6px;margin-top:6px">${fromCard ? '<button class="btn" data-sh="revroster" style="min-height:36px;padding:6px 12px">Reverter para o lido no cartão</button>' : ''}${differs ? '<button class="btn" data-sh="useroster" style="min-height:36px;padding:6px 12px">Usar nome e CPF da lista</button>' : ''}</div></div>`;
+    }
+  }
   const al = alertsOf(c).filter(a => !/^Sem CPF|^CPF inválido|^Sem nome/.test(a));
   $('#alerts').innerHTML = al.length ? al.map(a => `<div class="tag w" style="margin:0 6px 6px 0">${esc(a)}</div>`).join('') : '';
 }
@@ -2289,8 +2724,9 @@ async function sheetAction(a) {
   const ids = visibleCards().map(x => x.id), pos = ids.indexOf(c.id);
   if (a === 'close') return closeSheet();
   if (a === 'view' || a === 'zoom') return showViewer(c);
-  if (a === 'ocr') return rereadIdentity(c);
   if (a === 'marks') return rereadMarks(c);
+  if (a === 'useroster' && c.roster && c.roster.cpf) { c.idManual = true; c.name = c.roster.nome.toUpperCase(); c.cpf = fmtCpf(c.roster.cpf); applyRoster(c); saveSoon(c); $('#fName').value = c.name; $('#fCpf').value = c.cpf; refreshMeta(c); pvSoon(c); return; }
+  if (a === 'revroster' && c.ocrCpf !== undefined) { c.idManual = true; c.name = c.ocrName || ''; c.cpf = fmtCpf(c.ocrCpf || ''); applyRoster(c); saveSoon(c); $('#fName').value = c.name; $('#fCpf').value = c.cpf; refreshMeta(c); pvSoon(c); toast('Revertido para o que foi lido no cartão'); return; }
   if (a === 'only') { S.onlyAlerts = !S.onlyAlerts; const b = $('[data-sh="only"]'); b.classList.toggle('on', S.onlyAlerts); b.textContent = S.onlyAlerts ? 'Mostrando só alertas' : 'Mostrar só alertas'; return applyOnly(); }
   if (a === 'aus' || a === 'eli') { c[a] = !c[a]; c.flagManual = { ...c.flagManual, [a]: true }; c.flagNotice = ''; $(`[data-sh="${a}"]`).classList.toggle('on', c[a]); saveSoon(c); refreshMeta(c); return pvSoon(c); }
   if (a === 'prev' || a === 'next') { await saveCard(c); const n = ids[pos + (a === 'next' ? 1 : -1)]; if (n) { S.openId = n; drawSheet(S.cards.find(x => x.id === n)); $('#sheet .ovbody').scrollTop = 0; } return; }
@@ -2303,9 +2739,9 @@ async function sheetAction(a) {
     if (!await ask(`Excluir este cartão${c.name ? ' (' + esc(c.name) + ')' : ''}? Não dá para desfazer.`, 'Excluir', true)) return;
     S.cards = S.cards.filter(x => x.id !== c.id); dropUrls(c); await DB.del('cards', c.id);
     const wasCam = S.sheetOpts && S.sheetOpts.cam; await closeSheet(); renderHeader();
-    if (wasCam) setTab('cam'); return;
+    if (wasCam) setTab('list'); return;
   }
-  if (a === 'camnext') { c.rev = true; await saveCard(c); await closeSheet(); renderHeader(); toast('Salvo. Pode escanear o próximo'); setTab('cam'); return; }
+  if (a === 'camnext') { c.rev = true; await saveCard(c); await closeSheet(); renderHeader(); toast('Salvo'); setTab('list'); return; }
 }
 
 /* ================= câmera ================= */
@@ -2432,7 +2868,8 @@ async function gabFromPdf(file) {
 
 /* ================= navegação e eventos ================= */
 function setTab(t) {
-  if (S.tab === 'cam' && t !== 'cam') camStop();
+  if (t === 'cam') t = 'list';   // leitura por foto/câmera desativada: só PDF digitalizado
+  if (S.tab === 'cam') camStop();
   S.tab = t;
   $$('.view').forEach(v => v.classList.toggle('on', v.id === 'v-' + t));
   $$('#tabs button').forEach(b => b.classList.toggle('on', b.dataset.tab === t));
@@ -2451,9 +2888,13 @@ document.addEventListener('click', async e => {
   }
   switch (t.dataset.act) {
     case 'pdf': $('#fPdf').click(); break;
-    case 'img': $('#fImg').click(); break;
-    case 'camimg': case 'camsys': $('#fCam').click(); break;
-    case 'shoot': camCapture(false); break;
+    case 'roster': $('#fRoster').click(); break;
+    case 'noroster':
+      if (await ask('Remover a lista de inscritos? Nome e CPF dos cartões voltam a ser os lidos no cartão (exceto os que você editou).', 'Remover', true)) {
+        setRoster(null); await saveKV('roster', null); for (const c of S.cards) { applyRoster(c); saveCard(c); } renderList(); toast('Lista removida');
+      } break;
+    case 'guia': showScanGuide(); break;
+    case 'uso': showHowTo(); break;
     case 'gabpdf': $('#fGab').click(); break;
     case 'xlsx': exportXlsx(); break;
     case 'pdfx': exportPdf(); break;
@@ -2469,6 +2910,16 @@ document.addEventListener('input', e => {
 document.addEventListener('change', async e => {
   const t = e.target;
   if (t.id === 'fPdf') { const f = t.files; await importPdfs(f); t.value = ''; }
+  else if (t.id === 'fRoster') {
+    const file = t.files[0]; t.value = ''; if (!file) return;
+    try {
+      const r = await readRoster(file); setRoster(r); await saveKV('roster', { file: r.file, list: r.list });
+      const st = {}; for (const c of S.cards) { applyRoster(c); saveCard(c); st[c.roster.status] = (st[c.roster.status] || 0) + 1; }
+      renderList();
+      const resumo = S.cards.length ? `<br><br>Cartões já carregados: ${st.exato || 0} conferem${st.corrigido ? `, ${st.corrigido} com CPF corrigido` : ''}${st['nome-difere'] ? `, ${st['nome-difere']} com nome diferente` : ''}${st['por-nome'] ? `, ${st['por-nome']} identificados pelo nome` : ''}${st.ambiguo ? `, ${st.ambiguo} ambíguos` : ''}${st['nao-encontrado'] ? `, ${st['nao-encontrado']} fora da lista` : ''}.` : '<br><br>Os próximos PDFs carregados serão conferidos com ela.';
+      await ask(`<b>Lista de inscritos carregada</b><br>${r.list.length} inscritos lidos de ${esc(r.file)}${r.bad.length ? ` (${r.bad.length} linha(s) ignorada(s) por CPF ou nome inválido)` : ''}.${resumo}`, 'Ok', false, '');
+    } catch (err) { await ask(`<b>Não foi possível ler a lista</b><br>${esc(err.message)}<br>Use uma planilha com uma coluna "Nome" e uma coluna "CPF".`, 'Ok', false, ''); }
+  }
   else if (t.id === 'fImg') { const f = t.files; await importImages(f); t.value = ''; }
   else if (t.id === 'fCam') { const f = t.files; await importImages(f); t.value = ''; }
   else if (t.id === 'fGab') {
@@ -2487,7 +2938,9 @@ document.addEventListener('change', async e => {
   if (!S.memOnly) {
     try {
       const kv = await DB.all('kv');
-      for (const r of kv) { if (r.k === 'gab' && r.v && r.v.g && r.v.g.length === NQ) { S.gab = r.v.g; S.gabFrom = r.v.from || S.gabFrom; } if (r.k === 'cfg' && r.v) Object.assign(S.cfg, r.v); }
+      for (const r of kv) { if (r.k === 'gab' && r.v && r.v.g && r.v.g.length === NQ) { S.gab = r.v.g; S.gabFrom = r.v.from || S.gabFrom; } if (r.k === 'cfg' && r.v) Object.assign(S.cfg, r.v); if (r.k === 'avisoScan') S.avisoScan = r.v; if (r.k === 'roster' && r.v && r.v.list) setRoster(r.v); if (r.k === 'avisoUso') S.avisoUso = r.v; }
+      S.cfg.model = '2027';   // modelo único: letras dentro dos balões
+      applyCardModel(S.cfg.model);
       S.cards = (await DB.all('cards')).sort((a, b) => a.t - b.t);
       // A votação entre OCRs foi removida: qualquer escolha antiga (consenso, PP-OCR, PARSeq) vira Tesseract.
       if (S.cfg.ocr !== 'local' && S.cfg.ocr !== 'tesseract') { S.cfg.ocr = 'tesseract'; await DB.put('kv', { k: 'cfg', v: S.cfg }); }
@@ -2507,6 +2960,8 @@ document.addEventListener('change', async e => {
   window.__app = { S, DB };
   renderHeader(); renderList();
   if (S.memOnly) toast('Este navegador não deixa gravar dados: os cartões se perdem ao fechar', 6000);
+  if (!S.avisoScan) { await showScanGuide(); S.avisoScan = 1; saveKV('avisoScan', 1); }
+  if (!S.avisoUso) { await showHowTo(); S.avisoUso = 1; saveKV('avisoUso', 1); }
 })();
 </script>
 </body>
