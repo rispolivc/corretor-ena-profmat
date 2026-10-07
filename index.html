@@ -153,12 +153,10 @@ kbd{font:inherit;font-weight:700}
   </header>
   <main>
     <section class="view on" id="v-list"></section>
-    <section class="view" id="v-gab"></section>
     <section class="view" id="v-exp"></section>
   </main>
   <nav class="tabs" id="tabs">
     <button data-tab="list" class="on"><svg viewBox="0 0 24 24"><rect x="4" y="3" width="16" height="18" rx="2"/><path d="M8 8h8M8 12h8M8 16h5"/></svg>Provas</button>
-    <button data-tab="gab"><svg viewBox="0 0 24 24"><path d="M5 12l4 4 10-10"/><path d="M5 20h14"/></svg>Gabarito</button>
     <button data-tab="exp"><svg viewBox="0 0 24 24"><path d="M12 3v12M7 10l5 5 5-5"/><path d="M5 20h14"/></svg>Exportar</button>
   </nav>
 </div>
@@ -169,7 +167,6 @@ kbd{font:inherit;font-weight:700}
 <div id="toast"></div>
 <input type="file" id="fPdf" accept="application/pdf,.pdf" multiple hidden>
 <input type="file" id="fRoster" accept=".xlsx,.xls,.csv" hidden>
-<input type="file" id="fGab" accept="application/pdf,.pdf" hidden>
 
 <script>/**
  * @licstart The following is the entire license notice for the
@@ -1695,6 +1692,126 @@ const S = {
 };
 const thr = () => SENS[S.cfg.sens] || SENS.nor;
 
+/* ================= Configuração do servidor =================
+   gabarito.json (obrigatório) e config.json (opcional) ficam na mesma pasta do index.html
+   e são mantidos pelo administrador. Ver ESPECIFICACAO_API.md. */
+const CONFIG_URL = 'config.json', GABARITO_URL = 'gabarito.json';
+const RIGOR = { rigido: 'rig', normal: 'nor', sensivel: 'sen' };
+const STORE = { mode: 'local', api: '', token: '', credentials: 'same-origin', busy: false, error: '', timer: null };
+const apiOn = () => STORE.mode === 'api' && !!STORE.api;
+async function fetchJSON(url) { const r = await fetch(url, { cache: 'no-store' }); if (!r.ok) throw new Error(`${url} não encontrado (HTTP ${r.status})`); try { return await r.json(); } catch (e) { throw new Error(`${url} não é um JSON válido`); } }
+function parseGabarito(j) {
+  const g = [], errs = [];
+  for (let q = 1; q <= NQ; q++) {
+    const v = String(j?.[String(q)] ?? '').trim().toUpperCase();
+    if (/^[A-E]$/.test(v)) g.push(LET.indexOf(v));
+    else if (v === 'X' || v === 'ANULADA') g.push(5);            // anulada: ponto para todos
+    else { errs.push(`questão ${q}: ${v ? `"${v}"` : 'ausente'}`); g.push(-1); }
+  }
+  return { g, errs };
+}
+function applyConfig(c) {
+  if (!c || typeof c !== 'object') return;
+  if (c.prova) S.cfg.exam = String(c.prova);
+  if (+c.notaMaxima > 0) S.cfg.max = +c.notaMaxima;
+  const rg = String(c.rigorLeitura || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase();
+  if (RIGOR[rg]) S.cfg.sens = RIGOR[rg];
+  if (+c.dpiMinimo > 0) DPI_MIN = +c.dpiMinimo;
+  if (+c.dpiRecomendado > 0) DPI_PEDIDO = +c.dpiRecomendado;
+  const a = c.armazenamento || {};
+  STORE.mode = a.modo === 'api' ? 'api' : 'local';
+  STORE.api = String(a.api || '').replace(/\/+$/, '');
+  STORE.token = String(a.token || '');
+  STORE.credentials = a.credenciais === 'include' ? 'include' : 'same-origin';
+}
+async function loadServerConfig() {
+  try { applyConfig(await fetchJSON(CONFIG_URL)); } catch (e) { console.warn(e.message, '— usando configuração padrão'); }
+  try {
+    const p = parseGabarito(await fetchJSON(GABARITO_URL));
+    if (p.errs.length) throw new Error('gabarito.json inválido (' + p.errs.join('; ') + ')');
+    S.gab = p.g; S.gabOk = true; S.gabError = '';
+  } catch (e) { S.gabOk = false; S.gabError = e.message; }
+}
+
+/* ---------- cliente da API (modo "api") ----------
+   Os ids de lote e de cartão são gerados aqui e todos os envios são PUT por id: repetir um envio
+   que falhou não duplica nada no servidor. O que não foi enviado fica pendente e é reenviado. */
+async function api(method, path, body) {
+  const h = {}; if (STORE.token) h.Authorization = 'Bearer ' + STORE.token;
+  const r = await fetch(STORE.api + path, { method, headers: h, body, credentials: STORE.credentials });
+  if (!r.ok) { const e = new Error(`${method} ${path}: HTTP ${r.status}`); e.status = r.status; throw e; }
+  STORE.error = ''; STORE.denied = false;   // só uma resposta de sucesso limpa o erro
+  return (r.headers.get('content-type') || '').includes('json') ? r.json() : null;
+}
+const LETRA = (c, q) => isDouble(c, q) ? 'DUPLA' : c.ans[q] >= 0 ? LET[c.ans[q]] : '';
+function cardPayload(c) {
+  const estado = {}; for (const k in c) if (!(c[k] instanceof Blob)) estado[k] = c[k];   // tudo menos imagens
+  const sc = cardScore(c);
+  return {
+    id: c.id, lote: c.lote || '', arquivo: c.file || '', pagina: c.page || 0,
+    nome: c.name || '', cpf: c.cpf || '', ausente: !!c.aus, eliminado: !!c.eli,
+    acertos: c.aus ? null : sc, nota: c.aus ? null : Math.round(sc / NQ * S.cfg.max * 100) / 100,
+    respostas: Array.from({ length: NQ }, (_, q) => LETRA(c, q)), revisado: !!c.rev, alertas: alertsOf(c),
+    lista: ROSTER.list && c.roster ? ROSTER_TXT[c.roster.status] : '', lido_no_cartao: { nome: c.ocrName ?? '', cpf: c.ocrCpf ?? '' },
+    atualizado: new Date(c.mod || c.t).toISOString(), estado
+  };
+}
+function scheduleSync(ms = 1500) { if (!apiOn()) return; clearTimeout(STORE.timer); STORE.timer = setTimeout(syncAll, ms); }
+async function syncAll() {
+  if (!apiOn() || STORE.busy || S.memOnly) return;
+  STORE.busy = true; let ok = true;
+  try {
+    // 1) lotes (PDFs originais)
+    for (const r of await DB.all('kv')) {
+      if (!r.k.startsWith('lote:') || !r.v || r.v.enviado) continue;
+      const fd = new FormData(); fd.append('arquivo', r.v.blob, r.v.nome); fd.append('nome_arquivo', r.v.nome); fd.append('paginas', String(r.v.paginas || 0));
+      await api('PUT', `/lotes/${encodeURIComponent(r.k.slice(5))}`, fd);
+      await DB.put('kv', { k: r.k, v: { nome: r.v.nome, paginas: r.v.paginas, enviado: true } });   // guarda só o registro
+    }
+    // 2) exclusões pendentes
+    const del = (await DB.all('kv')).find(r => r.k === 'delPend'); const pend = del ? del.v.slice() : [];
+    while (pend.length) { try { await api('DELETE', `/cartoes/${encodeURIComponent(pend[0])}`); } catch (e) { if (e.status !== 404) throw e; } pend.shift(); await DB.put('kv', { k: 'delPend', v: pend }); }   // 404: já não existe, conta como apagado
+    // 3) cartões alterados
+    for (const c of S.cards.filter(c => c.sync !== 'ok')) {
+      const fd = new FormData(); fd.append('dados', JSON.stringify(cardPayload(c)));
+      if (!c.imgSent && c.img) fd.append('imagem', c.img, `${c.id}.jpg`);
+      await api('PUT', `/cartoes/${encodeURIComponent(c.id)}`, fd);
+      c.sync = 'ok'; c.imgSent = true; await DB.put('cards', c);
+    }
+  } catch (e) { ok = false; STORE.error = e.message; STORE.denied = e.status === 401 || e.status === 403; console.warn('sincronização:', e.message); }
+  finally { STORE.busy = false; renderHeader(); if (!ok) scheduleSync(30000); }
+}
+async function queueDelete(ids) {
+  if (!apiOn()) return;
+  const r = (await DB.all('kv')).find(r => r.k === 'delPend'); const pend = new Set(r ? r.v : []); ids.forEach(id => pend.add(id));
+  await DB.put('kv', { k: 'delPend', v: [...pend] }); scheduleSync(300);
+}
+async function queueLote(id, file, paginas) { if (!apiOn()) return; await DB.put('kv', { k: 'lote:' + id, v: { nome: file.name, paginas, blob: file, enviado: false } }); }
+/* traz do servidor os cartões que não estão neste navegador (ou que estão mais novos lá) */
+async function pullFromServer() {
+  if (!apiOn() || S.memOnly) return 0;
+  let list; try { list = await api('GET', '/cartoes'); } catch (e) { STORE.error = e.message; STORE.denied = e.status === 401 || e.status === 403; renderHeader(); return 0; }
+  let n = 0;
+  for (const it of Array.isArray(list) ? list : []) {
+    const d = it && it.dados, e = d && d.estado; if (!e || !e.id) continue;
+    const local = S.cards.find(c => c.id === e.id);
+    if (local && (local.sync !== 'ok' || (local.mod || local.t) >= Date.parse(d.atualizado || 0))) continue;
+    let img = local && local.img;
+    if (!img && it.imagem_url) { try { const r = await fetch(new URL(it.imagem_url, STORE.api + '/').href, { headers: STORE.token ? { Authorization: 'Bearer ' + STORE.token } : {}, credentials: STORE.credentials }); if (r.ok) img = await r.blob(); } catch (err) { console.warn(err); } }
+    if (!img) continue;
+    const c = Object.assign({}, e, { img, sync: 'ok', imgSent: true });
+    if (!c.thumb) { const bmp = await createImageBitmap(img), th = document.createElement('canvas'); th.width = 180; th.height = Math.round(180 * CH / CW); th.getContext('2d').drawImage(bmp, 0, 0, th.width, th.height); c.thumb = await blobOf(th, 'image/jpeg', 0.7); }
+    if (local) { dropUrls(local); Object.assign(local, c); } else S.cards.push(c);
+    await DB.put('cards', local || c); n++;
+  }
+  return n;
+}
+async function uploadExport(name, blob, tipo) {
+  if (!apiOn()) return;
+  try { const fd = new FormData(); fd.append('arquivo', blob, name); fd.append('tipo', tipo); fd.append('nome_arquivo', name); await api('PUT', `/planilhas/${encodeURIComponent(uid())}`, fd); toast('Arquivo salvo também no servidor'); }
+  catch (e) { toast('Não foi possível salvar no servidor: ' + e.message, 5000); }
+}
+
 /* ================= banco local (IndexedDB) ================= */
 const DB = {
   db: null,
@@ -1719,7 +1836,7 @@ const DB = {
   clear(s) { return S.memOnly ? Promise.resolve() : this.tx(s, 'readwrite', st => st.clear()); }
 };
 const saveKV = (k, v) => DB.put('kv', { k, v }).catch(console.warn);
-const saveCard = c => DB.put('cards', c).catch(e => { console.warn(e); toast('Falha ao gravar no aparelho'); });
+const saveCard = c => { c.mod = Date.now(); if (apiOn()) c.sync = 'pendente'; return DB.put('cards', c).then(() => scheduleSync()).catch(e => { console.warn(e); toast('Falha ao gravar no aparelho'); }); };
 
 const URLS = new Map();
 function urlOf(c, k) { const key = c.id + k; if (!URLS.has(key) && c[k]) URLS.set(key, URL.createObjectURL(c[k])); return URLS.get(key) || ''; }
@@ -2043,7 +2160,6 @@ function showHowTo() {
     d.innerHTML = `<div class="busybox" role="dialog" aria-labelledby="htT" style="width:min(92%,520px);max-height:86vh;overflow:auto">
       <h2 id="htT" style="margin:0 0 8px;font-size:18px">Como funciona a correção</h2>
       <ol style="margin:0 0 12px;padding-left:20px;line-height:1.45">
-        <li>Confira o gabarito na aba Gabarito.</li>
         <li>Se tiver, carregue a lista de inscritos (.xlsx com nome e CPF). Ela ajuda a confirmar nome e CPF.</li>
         <li>Carregue o PDF. O app lê as marcações, o nome e o CPF e calcula a nota.</li>
         <li>Abra os cartões com a etiqueta "Revisar", corrija o que for preciso e toque em "Marcar revisado".</li>
@@ -2057,7 +2173,7 @@ function showHowTo() {
         <li><b>Lista de inscritos:</b> CPF corrigido pela lista ou fora dela. Confira com o recorte.</li>
         <li><b>Ausente ou Eliminado:</b> confira a caixa e use os botões, se for o caso.</li>
       </ul>
-      <p style="margin:0 0 14px">Os cartões ficam salvos só neste navegador. Exporte antes de limpar o navegador.</p>
+      <p style="margin:0 0 14px">${apiOn() ? "Os cartões, as imagens e as planilhas exportadas são salvos no servidor." : "Os cartões ficam salvos só neste navegador. Exporte antes de limpar o navegador."}</p>
       <div class="row" style="justify-content:flex-end"><button class="btn pri" data-r="1">Entendi</button></div></div>`;
     d.onclick = e => { const b = e.target.closest('[data-r]'); if (!b) return; d.hidden = true; d.innerHTML = ''; res(true); };
     setTimeout(() => { const b = d.querySelector('[data-r]'); if (b) b.focus({ preventScroll: true }); }, 0);
@@ -2328,7 +2444,7 @@ function nameCpfFromItems(items) {
    página declarado no PDF nem a resolução em que o app renderiza (ampliar não recupera detalhe).
    pageImagePPI: pixels por polegada da maior imagem da página, seguindo a matriz de transformação do PDF.
    Depois de localizar o cartão, converte para pixels por polegada do próprio cartão (A4). */
-const DPI_MIN = 150, DPI_PEDIDO = 200;   // recusa abaixo de ~150 (com 5% de margem), mas orienta a digitalizar com 200
+let DPI_MIN = 150, DPI_PEDIDO = 200;   // recusa abaixo de ~150 (com 5% de margem), mas orienta a digitalizar com 200
 async function pageImagePPI(page) {
   const ops = await page.getOperatorList(), O = pdfjsLib.OPS;
   const mul = (m, n) => [m[0] * n[0] + m[2] * n[1], m[1] * n[0] + m[3] * n[1], m[0] * n[2] + m[2] * n[3], m[1] * n[2] + m[3] * n[3], m[0] * n[4] + m[2] * n[5] + m[4], m[1] * n[4] + m[3] * n[5] + m[5]];
@@ -2351,6 +2467,7 @@ async function pageImagePPI(page) {
   return Math.max(...imgs.filter(i => i.area >= 0.5 * maxA).map(i => i.ppi));
 }
 async function importPdfs(files) {
+  if (!S.gabOk) { await ask(`<b>Gabarito não configurado</b><br>${esc(S.gabError || '')}<br>A correção fica bloqueada até o administrador publicar um gabarito.json válido.`, 'Ok', false, ''); return; }
   files = [...files]; if (!files.length) return;
   Busy.show('Lendo cartões do PDF'); Busy.set('Carregando o leitor de PDF…', 0);
   try { await loadLib('pdfjs'); } catch (e) { Busy.done({ msg: esc(e.message) }); return; }
@@ -2402,7 +2519,8 @@ async function importPdfs(files) {
       doneN++;
     }
     if (low.length) { rejected.push({ f: f.name, dpis: low }); continue; }   // descarta o arquivo inteiro
-    for (const c of pending) { applyRoster(c); S.cards.push(c); await saveCard(c); okN++; }
+    const loteId = uid(); await queueLote(loteId, f, pdf.numPages);
+    for (const c of pending) { c.lote = loteId; applyRoster(c); S.cards.push(c); await saveCard(c); okN++; }
     fails.push(...fileFails);
   }
   renderList(); renderHeader();
@@ -2512,6 +2630,7 @@ async function exportXlsx() {
     XLSX.utils.book_append_sheet(wb, wm, 'Inscritos sem cartão');
   }
   const out = XLSX.write(wb, { bookType: 'xlsx', type: 'array' });
+  { const nm = `resultados_${slug(S.cfg.exam)}.xlsx`, bl = new Blob([out], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' }); uploadExport(nm, bl, 'planilha'); }
   if (await saveFile(`resultados_${slug(S.cfg.exam)}.xlsx`, new Blob([out], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' }))) toast('Planilha pronta');
 }
 async function exportPdf() {
@@ -2531,6 +2650,7 @@ async function exportPdf() {
   if (Busy.cancel) { Busy.done({ msg: 'Interrompido. Nada foi salvo.' }); return; }
   Busy.set('Gerando arquivo…', 1); await tick();
   const blob = doc.output('blob'); Busy.hide();
+  uploadExport(`cartoes_anotados_${slug(S.cfg.exam)}.pdf`, blob, 'cartoes_anotados');
   if (await saveFile(`cartoes_anotados_${slug(S.cfg.exam)}.pdf`, blob)) toast('PDF pronto');
 }
 
@@ -2538,14 +2658,17 @@ async function exportPdf() {
 function renderHeader() {
   $('#examName').textContent = S.cfg.exam || '';
   const p = $('#pers');
-  p.hidden = !S.memOnly;
-  p.textContent = S.memOnly ? 'Sem gravação no aparelho' : '';
+  const pend = apiOn() ? S.cards.filter(c => c.sync !== 'ok').length : 0;
+  p.hidden = !S.memOnly && !apiOn();
+  p.textContent = S.memOnly ? 'Sem gravação no aparelho' : !apiOn() ? '' : STORE.error ? `${STORE.denied ? 'Servidor recusou o acesso' : 'Sem conexão com o servidor'}${pend ? ` · ${pend} pendente(s)` : ''}` : pend ? `Enviando ao servidor… ${pend} pendente(s)` : 'Salvo no servidor';
+  p.className = 'pers' + (apiOn() && STORE.error ? ' bad' : '');
 }
 function renderList() {
   const el = $('#v-list'), all = S.cards, vis = visibleCards();
   const rev = all.filter(needsReview).length, sc = all.filter(c => !c.aus).map(cardScore);
   const avg = sc.length ? sc.reduce((a, b) => a + b, 0) / sc.length : 0;
-  let h = `<div class="row list-actions" style="margin:6px 0 4px"><button class="btn pri grow" data-act="pdf">Carregar PDF de cartões</button><button class="btn dng" data-act="wipe" ${all.length ? '' : 'disabled'}>Apagar tudo</button></div>`;
+  let h = S.gabOk ? '' : `<div class="fail" style="border-left:4px solid var(--bad);color:var(--ink);margin:6px 0"><b style="color:var(--bad)">Gabarito não configurado.</b> ${esc(S.gabError || '')}<br>A correção fica bloqueada até o administrador publicar um gabarito.json válido.</div>`;
+  h += `<div class="row list-actions" style="margin:6px 0 4px"><button class="btn pri grow" data-act="pdf" ${S.gabOk ? '' : 'disabled'}>Carregar PDF de cartões</button><button class="btn dng" data-act="wipe" ${all.length ? '' : 'disabled'}>Apagar tudo</button></div>`;
   {
     const withR = all.filter(c => c.roster), okR = withR.filter(c => c.roster.status === 'exato').length;
     h += ROSTER.list
@@ -2598,8 +2721,8 @@ function renderExp() {
   <div class="row" style="flex-direction:column;align-items:stretch;margin:12px 0"><button class="btn pri" data-act="xlsx">Planilha (.xlsx): nome, CPF, acertos, nota, respostas</button>
   <button class="btn" data-act="pdfx">PDF com todos os cartões anotados</button></div>
   <div class="note">No PDF, cada página é o cartão do aluno com ✓ azul nos acertos, ✗ vermelho nos erros (a resposta certa aparece ao lado), 0 laranja nas questões zeradas por dupla marcação e o total no campo "Total de acertos na prova".</div>
-  <h2>Dados neste aparelho</h2>
-  <div class="note">Os cartões, fotos e notas ficam só neste navegador (nada é enviado a servidor). Se limpar os dados do navegador, eles somem, então exporte antes.</div>
+  <h2>${apiOn() ? 'Dados no servidor' : 'Dados neste aparelho'}</h2>
+  <div class="note">${apiOn() ? 'Os PDFs enviados, os cartões, as correções da revisão e as planilhas exportadas são salvos no servidor. Apagar um cartão aqui também o apaga no servidor.' : 'Os cartões e as notas ficam só neste navegador. Se limpar os dados do navegador, eles somem, então exporte antes.'}</div>
   <div class="row" style="margin-top:10px"><button class="btn dng" data-act="wipe">Apagar todos os cartões</button></div>`;
 }
 
@@ -2737,7 +2860,7 @@ async function sheetAction(a) {
   }
   if (a === 'del') {
     if (!await ask(`Excluir este cartão${c.name ? ' (' + esc(c.name) + ')' : ''}? Não dá para desfazer.`, 'Excluir', true)) return;
-    S.cards = S.cards.filter(x => x.id !== c.id); dropUrls(c); await DB.del('cards', c.id);
+    S.cards = S.cards.filter(x => x.id !== c.id); dropUrls(c); await DB.del('cards', c.id); await queueDelete([c.id]);
     const wasCam = S.sheetOpts && S.sheetOpts.cam; await closeSheet(); renderHeader();
     if (wasCam) setTab('list'); return;
   }
@@ -2868,6 +2991,7 @@ async function gabFromPdf(file) {
 
 /* ================= navegação e eventos ================= */
 function setTab(t) {
+  if (t === 'gab') t = 'list';   // gabarito agora vem do gabarito.json (administrador)
   if (t === 'cam') t = 'list';   // leitura por foto/câmera desativada: só PDF digitalizado
   if (S.tab === 'cam') camStop();
   S.tab = t;
@@ -2900,7 +3024,7 @@ document.addEventListener('click', async e => {
     case 'pdfx': exportPdf(); break;
     case 'wipe':
       if (await ask(`Apagar os ${S.cards.length} cartões gravados neste aparelho? Exporte a planilha antes se precisar. Não dá para desfazer.`, 'Apagar tudo', true)) {
-        S.cards.forEach(dropUrls); S.cards = []; await DB.clear('cards'); renderExp(); renderList(); toast('Tudo apagado');
+        const ids = S.cards.map(c => c.id); S.cards.forEach(dropUrls); S.cards = []; await DB.clear('cards'); await queueDelete(ids); renderExp(); renderList(); toast('Tudo apagado');
       } break;
   }
 });
@@ -2953,12 +3077,15 @@ document.addEventListener('change', async e => {
         await DB.put('kv', { k: 'gab', v: { g: S.gab, from: S.gabFrom } });
         await DB.put('kv', { k: 'uiEna2027', v: 1 });
       }
+      await loadServerConfig();   // config.json e gabarito.json prevalecem sobre o que estava gravado
     } catch (e) { console.warn(e); S.memOnly = true; }
     try { if (navigator.storage && navigator.storage.persist) S.persist = await navigator.storage.persist(); } catch (e) { }
   }
   try { const w = document.getElementById('pdfw'); if (w && window.pdfjsLib) pdfjsLib.GlobalWorkerOptions.workerSrc = URL.createObjectURL(new Blob([w.textContent], { type: 'text/javascript' })); } catch (e) { console.warn(e); }
-  window.__app = { S, DB };
+  if (S.memOnly) await loadServerConfig();
+  window.__app = { S, DB, STORE };
   renderHeader(); renderList();
+  if (apiOn()) { const n = await pullFromServer(); if (n) { renderList(); toast(`${n} cartão(ões) carregado(s) do servidor`); } syncAll(); setInterval(() => syncAll(), 60000); }
   if (S.memOnly) toast('Este navegador não deixa gravar dados: os cartões se perdem ao fechar', 6000);
   if (!S.avisoScan) { await showScanGuide(); S.avisoScan = 1; saveKV('avisoScan', 1); }
   if (!S.avisoUso) { await showHowTo(); S.avisoUso = 1; saveKV('avisoUso', 1); }
