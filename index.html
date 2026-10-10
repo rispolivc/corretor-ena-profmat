@@ -1236,12 +1236,14 @@ function classify(fills, thr, evidence) {
   }
   return {ans,st};
 }
-/* Dupla marcação sempre zera a questão, mesmo contendo a alternativa correta. */
+/* Questão anulada vale ponto para todos (inclusive branco e dupla marcação).
+   Nas demais, dupla marcação zera a questão, mesmo contendo a alternativa correta. */
 function score(ans, gab, status) {
   let s = 0;
   for (let q = 0; q < NQ; q++) {
+    if (gab[q] === 5) { s++; continue; }
     if (ans[q] === -2 || (status && status[q] === 'double')) continue;
-    if (gab[q] === 5 || (ans[q] >= 0 && ans[q] === gab[q])) s++;
+    if (ans[q] >= 0 && ans[q] === gab[q]) s++;
   }
   return s;
 }
@@ -1705,7 +1707,7 @@ function parseGabarito(j) {
   for (let q = 1; q <= NQ; q++) {
     const v = String(j?.[String(q)] ?? '').trim().toUpperCase();
     if (/^[A-E]$/.test(v)) g.push(LET.indexOf(v));
-    else if (v === 'X' || v === 'ANULADA') g.push(5);            // anulada: ponto para todos
+    else if (v === 'X' || v === 'ANULADA') g.push(5);            // anulada: ponto para todos (inclusive branco e dupla marcação)
     else { errs.push(`questão ${q}: ${v ? `"${v}"` : 'ausente'}`); g.push(-1); }
   }
   return { g, errs };
@@ -2167,7 +2169,7 @@ function showHowTo() {
       </ol>
       <p style="margin:0 0 6px"><b>O que pede revisão</b></p>
       <ul style="margin:0 0 12px;padding-left:20px;line-height:1.45">
-        <li><b>Dupla marcação:</b> duas alternativas marcadas ou rasura em outra. A questão vale zero. Se for engano de leitura, toque na letra certa.</li>
+        <li><b>Dupla marcação:</b> duas alternativas marcadas ou rasura em outra. A questão vale zero (exceto se anulada, que vale ponto para todos). Se for engano de leitura, toque na letra certa.</li>
         <li><b>Marcação fraca:</b> preenchimento incompleto. Confira a alternativa lida.</li>
         <li><b>Nome ou CPF com dúvida:</b> corrija pelo recorte do cartão.</li>
         <li><b>Lista de inscritos:</b> CPF corrigido pela lista ou fora dela. Confira com o recorte.</li>
@@ -2318,7 +2320,7 @@ function rosterAlert(c) {
 }
 function alertsOf(c) {
   const a = [];
-  const d = c.ans.map((_, i) => isDouble(c, i) ? i + 1 : 0).filter(Boolean);
+  const d = c.ans.map((_, i) => isDouble(c, i) && S.gab[i] !== 5 ? i + 1 : 0).filter(Boolean);
   const w = c.st.map((s, i) => s === 'weak' ? i + 1 : 0).filter(Boolean);
   if (d.length) a.push('Dupla marcação — questão zerada: ' + d.map(n => 'Q' + n).join(', '));
   if (w.length) a.push('Marcação fraca ou traço suspeito: ' + w.map(n => 'Q' + n).join(', '));
@@ -2562,14 +2564,14 @@ async function annotate(c, scale = 1) {
   x.lineJoin = 'round'; x.lineCap = 'round';
   for (let q = 0; q < NQ; q++) {
     const off = { dx: c.offs ? c.offs[q][0] : 0, dy: c.offs ? c.offs[q][1] : 0 };
-    const a = c.ans[q], gk = S.gab[q], double = isDouble(c, q), ok = !double && (gk === 5 || (a >= 0 && a === gk));
+    const a = c.ans[q], gk = S.gab[q], double = isDouble(c, q), ok = gk === 5 || (!double && a >= 0 && a === gk);
     const gr = boxRect(q, 5, off), cx = gr.x + gr.w / 2, cy = gr.y + gr.h / 2;
     x.lineWidth = 4;
     if (a >= 0 && !double) { const r = boxRect(q, a, off); x.strokeStyle = ok ? OKC : BADC; x.strokeRect(r.x - 2, r.y - 2, r.w + 4, r.h + 4); }
     if (double) { x.strokeStyle = WARNC; for (let k = 0; k < 5; k++) if (markedAlternative(c, q, k)) { const r = boxRect(q, k, off); x.strokeRect(r.x - 2, r.y - 2, r.w + 4, r.h + 4); } }
     if (gk < 5 && !ok && !double) { const r = boxRect(q, gk, off); x.setLineDash([7, 5]); x.lineWidth = 3; x.strokeStyle = OKC; x.strokeRect(r.x - 2, r.y - 2, r.w + 4, r.h + 4); x.setLineDash([]); }
     x.lineWidth = 4.5; x.font = '700 22px system-ui, sans-serif'; x.textBaseline = 'middle'; x.textAlign = 'left';
-    if (double) { x.fillStyle = WARNC; x.textAlign = 'center'; x.font = '800 23px system-ui,sans-serif'; x.fillText('0', cx, cy + 1); }
+    if (double && gk !== 5) { x.fillStyle = WARNC; x.textAlign = 'center'; x.font = '800 23px system-ui,sans-serif'; x.fillText('0', cx, cy + 1); }
     else if (gk === 5) { x.fillStyle = BLUE; x.textAlign = 'center'; x.font = '700 16px system-ui,sans-serif'; x.fillText('anul.', cx, cy + 1); }
     else if (ok) { x.strokeStyle = OKC; x.beginPath(); x.moveTo(cx - 9, cy); x.lineTo(cx - 2, cy + 8); x.lineTo(cx + 10, cy - 8); x.stroke(); }
     else {
@@ -2615,7 +2617,7 @@ async function exportXlsx() {
     const sc = cardScore(c);
     rows.push([c.name || '', c.cpf || '', c.aus ? '' : sc, c.aus ? '' : Math.round(sc / NQ * S.cfg.max * 100) / 100,
       c.aus ? 'Ausente' : c.eli ? 'Eliminado' : 'Presente', c.rev ? 'Revisado' : (alertsOf(c).length ? 'Pendente' : 'Sem alertas'), alertsOf(c).join(' | '), ROSTER.list && c.roster ? ROSTER_TXT[c.roster.status] : '']
-      .concat(c.ans.map((a, q) => isDouble(c, q) ? 'DUPLA (0)' : a >= 0 ? LET[a] : '')));
+      .concat(c.ans.map((a, q) => isDouble(c, q) ? (S.gab[q] === 5 ? 'DUPLA (anulada: ponto)' : 'DUPLA (0)') : a >= 0 ? LET[a] : '')));
   }
   const ws = XLSX.utils.aoa_to_sheet(rows);
   ws['!cols'] = [{ wch: 38 }, { wch: 16 }, { wch: 9 }, { wch: 8 }, { wch: 11 }, { wch: 12 }, { wch: 36 }, { wch: 22 }].concat(Array(NQ).fill({ wch: 12 }));
@@ -2698,7 +2700,7 @@ function renderGab() {
   for (let q = 0; q < NQ; q++) {
     rows += `<div class="qr"><span class="qn">${q + 1}</span>${[0, 1, 2, 3, 4].map(k => `<button class="chip ${S.gab[q] === k ? 'sel' : ''}" data-g="${q},${k}">${LET[k]}</button>`).join('')}<button class="chip an ${S.gab[q] === 5 ? 'sel' : ''}" data-g="${q},5">Anulada</button></div>`;
   }
-  el.innerHTML = `<h2 style="margin-top:8px">Gabarito</h2><div class="note">Referência: ${esc(S.gabFrom)}.${S.gabFrom === 'ENA 2027 — conferir alternativas' ? ' As alternativas do modelo anterior foram mantidas; confira ou importe o gabarito da aplicação.' : ''} Toque numa letra para alterar. "Anulada" dá o ponto às respostas sem dupla marcação. Dupla marcação sempre vale zero. Mudar aqui recalcula todas as notas.</div>
+  el.innerHTML = `<h2 style="margin-top:8px">Gabarito</h2><div class="note">Referência: ${esc(S.gabFrom)}.${S.gabFrom === 'ENA 2027 — conferir alternativas' ? ' As alternativas do modelo anterior foram mantidas; confira ou importe o gabarito da aplicação.' : ''} Toque numa letra para alterar. "Anulada" dá o ponto a todos, inclusive em branco e dupla marcação. Nas demais questões, dupla marcação vale zero. Mudar aqui recalcula todas as notas.</div>
   <div class="row" style="margin:10px 0"><button class="btn" data-act="gabpdf">Importar de PDF</button></div>
   <div class="gab">${rows}</div>
   <h2>Ajustes</h2>
@@ -2729,7 +2731,7 @@ function renderExp() {
 /* ---------- revisão ---------- */
 function rowHtml(c, q) {
   const st = c.st[q], a = c.ans[q], g = S.gab[q], double = isDouble(c, q), fl = double || st === 'weak';
-  const lab = double ? 'dupla marcação — zerada (0)' : st === 'weak' ? 'marcação fraca / traço suspeito' : st === 'blank' ? 'em branco' : (c.man[q] ? 'ajustada' : '');
+  const lab = double ? (g === 5 ? 'dupla marcação — questão anulada (ponto concedido)' : 'dupla marcação — zerada (0)') : st === 'weak' ? 'marcação fraca / traço suspeito' : st === 'blank' ? 'em branco' : (c.man[q] ? 'ajustada' : '');
   const chips = [0, 1, 2, 3, 4].map(k => {
     let cl = 'chip';
     if (double) { if (markedAlternative(c, q, k)) cl += ' dbl'; }
