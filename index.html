@@ -1248,39 +1248,65 @@ function readFlags(gray) {
       const score = Math.min(a, z) + .25 * (a + z) - .002 * (Math.abs(x - b.x) + Math.abs(w - b.w));
       if (!sides || score > sides.score) sides = { x, w, score, confidence: Math.min(a, z) };
     }
-    // interior (afastado 5 px da moldura) e papel da própria caixa
-    const ix0 = sides.x + 5, ix1 = sides.x + sides.w - 5, iy0 = best.y + 5, iy1 = best.y + best.h - 5, iw = ix1 - ix0, ih = iy1 - iy0;
-    let mark = 0, ink = 0;
+    /* Leitura do interior, como nas questões: o limiar vem do papel AO REDOR da caixa (Pl) e não do
+       interior dela — com a bolha pintada, o "papel" medido dentro da caixa ficava escuro e a tinta
+       sumia da leitura (só o X, que cobre pouca área, era percebido).
+       Medidas:  fill  = fração do interior com tinta;
+                 solid = fração com tinta GROSSA (sobrevive a uma erosão de ~7 px): pintura/rabisco denso;
+                         um X ou um traço de caneta tem tinta fina e quase não deixa "solid".
+       Classes:  cheia   = bolha pintada;  parcial = pintada em parte;  x = só traço(s), sem pintura. */
+    const ix0 = sides.x + 6, ix1 = sides.x + sides.w - 6, iy0 = best.y + 5, iy1 = best.y + best.h - 5, iw = ix1 - ix0, ih = iy1 - iy0;
+    let fill = 0, solid = 0, mark = 0, kind = null;
     if (iw > 10 && ih > 10) {
-      const h2 = new Uint32Array(256); for (let y = iy0; y < iy1; y++) for (let x = ix0; x < ix1; x++) h2[gray[y * CW + x]]++;
-      let a2 = 0, Pb = 255; for (let i = 255; i >= 0; i--) { a2 += h2[i]; if (a2 >= iw * ih * 0.4) { Pb = i; break; } }
-      const T = Math.min(Pb * 0.72, Pb - 35), mask = new Uint8Array(iw * ih);
+      const T = Math.max(60, Pl * 0.62), mask = new Uint8Array(iw * ih);
+      let ink = 0;
       for (let y = 0; y < ih; y++) for (let x = 0; x < iw; x++) if (gray[(iy0 + y) * CW + ix0 + x] < T) { mask[y * iw + x] = 1; ink++; }
-      // resto de moldura (grossa ou inclinada na foto): componente quase todo colado à borda do interior
+      fill = ink / (iw * ih);
+      // tinta grossa: pixels cuja vizinhança (2r+1)² é toda escura (soma em imagem integral)
+      const r = 3, W1 = iw + 1, ii = new Uint32Array(W1 * (ih + 1));
+      for (let y = 0; y < ih; y++) { let row = 0; for (let x = 0; x < iw; x++) { row += mask[y * iw + x]; ii[(y + 1) * W1 + x + 1] = ii[y * W1 + x + 1] + row; } }
+      const full = (2 * r + 1) * (2 * r + 1); let sol = 0;
+      for (let y = r; y < ih - r; y++) for (let x = r; x < iw - r; x++) {
+        const sum = ii[(y + r + 1) * W1 + x + r + 1] - ii[(y - r) * W1 + x + r + 1] - ii[(y + r + 1) * W1 + x - r] + ii[(y - r) * W1 + x - r];
+        if (sum === full) sol++;
+      }
+      solid = sol / (iw * ih);
+      // traço: componente que não seja resto da moldura (colado à borda do interior)
       const comps = _cc(mask, iw, ih), rim = new Float64Array(comps.length + 1);
       for (let y = 0; y < ih; y++) for (let x = 0; x < iw; x++) { const id = comps.lab[y * iw + x]; if (id && (x < 4 || x >= iw - 4 || y < 4 || y >= ih - 4)) rim[id]++; }
       for (const c of comps) {
         const edgeHug = rim[c.id] / c.a >= 0.8 || c.w <= 3 || c.h <= 3;
         if (!edgeHug && c.w >= 8 && c.h >= 8 && c.a >= 35) mark = Math.max(mark, c.a);
       }
-      ink /= iw * ih;
+      const wk = ({ rig: .18, nor: .12, sen: .08 }[(typeof S !== 'undefined' && S.cfg && S.cfg.sens) || 'nor'] || .12) / .12;   // rigor da leitura (como nos balões)
+      if (fill >= 0.50 || solid >= 0.35) kind = 'cheia';
+      else if (solid >= 0.07 * wk && fill >= 0.14 * wk) kind = 'parcial';
+      else if (mark >= 35) kind = 'x';
     }
-    out[k] = Math.round(ink * 1000) / 1000;
-    out[k + 'Mark'] = mark >= 35;
+    out[k] = Math.round(fill * 1000) / 1000;
+    out[k + 'Fill'] = out[k];
+    out[k + 'Solid'] = Math.round(solid * 1000) / 1000;
+    out[k + 'Kind'] = kind;
+    out[k + 'Mark'] = !!kind;
     out[k + 'Size'] = mark;
     out[k + 'Located'] = best.confidence >= .55 && sides.confidence >= .55;
+    out[k + 'Rect'] = { x: sides.x, y: best.y, w: sides.w, h: best.h };
   }
   return out;
 }
 /* Ausente e Eliminado seguem a mesma regra:
    - só são marcados automaticamente quando a caixa foi localizada, há um traço nela e o cartão não tem respostas;
    - com respostas, a marca vira alerta para conferência (o cartão segue como presente / não eliminado). */
+const FLAG_KIND = { cheia: 'bolha pintada', parcial: 'bolha parcialmente pintada', x: 'X ou traço' };
 function flagDecision(fl, ans) {
   const answered = ans.some(a => a >= 0 || a === -2), notices = [];
   // cartões antigos (sem ausMark) usam a medida anterior, que exigia a caixa localizada
   const ausM = fl.ausMark ?? (fl.aus > .03 && fl.ausLocated), eliM = fl.eliMark ?? (fl.eli > .03 && fl.eliLocated);
-  if (ausM && answered) notices.push('Há respostas e uma possível marca em Ausente. Mantido como presente: confira a caixa.');
-  if (eliM && answered) notices.push('Há respostas e uma possível marca em Eliminado. Mantido como não eliminado: confira a caixa.');
+  const kA = FLAG_KIND[fl.ausKind] || '', kE = FLAG_KIND[fl.eliKind] || '';
+  if (ausM && answered) notices.push(`Há respostas e uma possível marca em Ausente${kA ? ' (' + kA + ')' : ''}. Mantido como presente: confira a caixa.`);
+  if (eliM && answered) notices.push(`Há respostas e uma possível marca em Eliminado${kE ? ' (' + kE + ')' : ''}. Mantido como não eliminado: confira a caixa.`);
+  if (!answered && ausM && fl.ausKind === 'parcial') notices.push('Ausente com a bolha só parcialmente pintada: confira.');
+  if (!answered && eliM && fl.eliKind === 'parcial') notices.push('Eliminado com a bolha só parcialmente pintada: confira.');
   if ((fl.ausMark && fl.ausLocated === false) || (fl.eliMark && fl.eliLocated === false)) notices.push('Não foi possível confirmar a moldura da caixa de situação: confira Ausente/Eliminado.');
   if (!answered && !ausM) notices.push('Nenhuma resposta e Ausente não marcado: confira se o candidato faltou.');
   return { aus: ausM && !answered, eli: eliM && !answered, flagNotice: notices.join(' ') };
@@ -2649,6 +2675,14 @@ async function annotate(c, scale = 1) {
       else { x.font = '700 18px system-ui,sans-serif'; x.fillText(a === -2 ? '2×' : '–', cx - 22, cy + 1); x.font = '700 22px system-ui,sans-serif'; }
       x.fillStyle = OKC; x.fillText(LET[gk], cx + 2, cy + 1);
     }
+  }
+  /* caixas Ausente / Eliminado: mesma leitura das questões, identificadas em roxo, sem texto
+     (contorno cheio = marca encontrada ou marcada à mão; tracejado = caixa lida, sem marca) */
+  const FLAGC = '#8e3fc4', fr = c.flagRead || {};
+  for (const k of ['aus', 'eli']) {
+    const on = !!(fr[k + 'Kind'] || fr[k + 'Mark'] || c[k]), b = fr[k + 'Rect'] || FLAGBOX[k];
+    x.strokeStyle = FLAGC; x.lineWidth = on ? 4 : 2.5; x.setLineDash(on ? [] : [7, 5]);
+    x.strokeRect(b.x - 3, b.y - 3, b.w + 6, b.h + 6); x.setLineDash([]);
   }
   const sc = cardScore(c);
   x.textAlign = 'left'; x.textBaseline = 'middle'; x.fillStyle = BADC; x.font = '800 56px system-ui, sans-serif';
