@@ -3175,7 +3175,7 @@
         <li>Se tiver, carregue a lista de inscritos (.xlsx com nome e CPF). Ela ajuda a confirmar nome e CPF.</li>
         <li>Carregue o PDF. O app lê as marcações, o nome e o CPF e calcula a nota.</li>
         <li>Abra os cartões com a etiqueta "Revisar", corrija o que for preciso e toque em "Marcar revisado".</li>
-        <li>Se carregou a lista de inscritos, a exportação adiciona a coluna Nota a uma cópia dela. Sem lista, exporta nome, CPF, acertos e respostas como antes. O PDF anotado fica na aba Exportar.</li>
+        <li>Se carregou a lista de inscritos, a exportação adiciona Nota e cria uma aba Resultados com as respostas de Q1 a Q30. Sem lista, exporta nome, CPF, acertos e respostas como antes. O PDF anotado fica na aba Exportar.</li>
       </ol>
       <p style="margin:0 0 6px"><b>O que pede revisão</b></p>
       <ul style="margin:0 0 12px;padding-left:20px;line-height:1.45">
@@ -3739,6 +3739,102 @@
         return XLSX.CFB.write(zip, { type: 'array', fileType: 'zip', compression: true });
       }
 
+      /* Os mesmos dados da exportação tradicional, agora também disponíveis
+         dentro da planilha dos inscritos em uma aba independente. */
+      function buildResultRows() {
+        const head = ['Nome', 'CPF', 'Acertos', 'Nota', 'Situação', 'Revisão', 'Alertas', 'Lista de inscritos']
+          .concat(Array.from({ length: NQ }, (_, i) => 'Q' + (i + 1)));
+        const rows = [head];
+        for (const c of sortedCards()) {
+          const sc = cardScore(c);
+          rows.push([c.name || '', c.cpf || '', c.aus ? '' : sc,
+            c.aus ? '' : Math.round(sc / NQ * S.cfg.max * 100) / 100,
+            c.aus ? 'Ausente' : c.eli ? 'Eliminado' : 'Presente',
+            c.rev ? 'Revisado' : (alertsOf(c).length ? 'Pendente' : 'Sem alertas'),
+            alertsOf(c).join(' | '), ROSTER.list && c.roster ? ROSTER_TXT[c.roster.status] || '' : '']
+            .concat(c.ans.map((a, q) => isDouble(c, q)
+              ? (S.gab[q] === 5 ? 'DUPLA (anulada: ponto)' : 'DUPLA (0)')
+              : a >= 0 ? LET[a] : '')));
+        }
+        return rows;
+      }
+
+      /* Adiciona apenas os novos componentes OOXML ao arquivo já modificado.
+         Evita regravar as abas existentes e perder filtros, estilos ou mesclagens.
+         As strings usam inlineStr; números permanecem numéricos para as estatísticas. */
+      function addResultsSheetToXlsx(bytes, rows) {
+        const zip = XLSX.CFB.read(new Uint8Array(bytes), { type: 'array' });
+        const part = path => {
+          const e = XLSX.CFB.find(zip, path);
+          if (!e || !e.content) throw new Error('Parte ausente da planilha: ' + path);
+          return new TextDecoder('utf-8').decode(e.content);
+        };
+        const put = (path, value) => XLSX.CFB.utils.cfb_add(zip, path, new TextEncoder().encode(value));
+        const xmlSafe = v => String(v).replace(/&/g, '&amp;').replace(/</g, '&lt;')
+          .replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&apos;');
+        let book = part('/xl/workbook.xml');
+        let rels = part('/xl/_rels/workbook.xml.rels');
+        let types = part('/[Content_Types].xml');
+        if (!book.includes('</sheets>') || !rels.includes('</Relationships>') || !types.includes('</Types>')) {
+          throw new Error('Estrutura do arquivo Excel não reconhecida.');
+        }
+        const existingTags = [...book.matchAll(/<sheet\b[^>]*>/g)].map(m => m[0]);
+        const existingNames = existingTags.map(t => (t.match(/\bname="([^"]+)"/) || [,''])[1]
+          .replace(/&quot;/g, '"').replace(/&apos;/g, "'").replace(/&lt;/g, '<')
+          .replace(/&gt;/g, '>').replace(/&amp;/g, '&').toLocaleLowerCase());
+        let sheetName = 'Resultados', n = 2;
+        while (existingNames.includes(sheetName.toLocaleLowerCase())) sheetName = 'Resultados (' + n++ + ')';
+        const sheetId = Math.max(0, ...existingTags.map(t => Number((t.match(/\bsheetId="(\d+)"/) || [,'0'])[1]))) + 1;
+        const relIds = [...rels.matchAll(/\bId="rId(\d+)"/g)].map(m => Number(m[1]));
+        const relId = 'rId' + (Math.max(0, ...relIds) + 1);
+        let sheetFileN = 1;
+        while (XLSX.CFB.find(zip, '/xl/worksheets/sheet' + sheetFileN + '.xml')) sheetFileN++;
+        const sheetPath = '/xl/worksheets/sheet' + sheetFileN + '.xml';
+        const numCols = rows[0].length;
+        const lastCol = XLSX.utils.encode_col(numCols - 1);
+        const lastRow = Math.max(rows.length, 1);
+        const colWidths = [38, 17, 10, 10, 13, 14, 42, 26];
+        const cols = '<cols>' + Array.from({ length: numCols }, (_, c) =>
+          `<col min="${c + 1}" max="${c + 1}" width="${colWidths[c] || 12}" customWidth="1"/>`).join('') + '</cols>';
+        const xmlRows = rows.map((row, ri) => {
+          const cells = row.map((val, ci) => {
+            if (val == null || val === '') return '';
+            const ref = XLSX.utils.encode_col(ci) + (ri + 1);
+            if (typeof val === 'number' && Number.isFinite(val))
+              return `<c r="${ref}" t="n"><v>${val}</v></c>`;
+            return `<c r="${ref}" t="inlineStr"><is><t>${xmlSafe(val)}</t></is></c>`;
+          }).join('');
+          return `<row r="${ri + 1}">${cells}</row>`;
+        }).join('');
+        const sheetXml = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>` +
+          `<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">` +
+          `<dimension ref="A1:${lastCol}${lastRow}"/>` +
+          `<sheetViews><sheetView workbookViewId="0"><pane xSplit="2" ySplit="1" topLeftCell="C2" activePane="bottomRight" state="frozen"/></sheetView></sheetViews>` +
+          `<sheetFormatPr defaultRowHeight="15"/>${cols}<sheetData>${xmlRows}</sheetData>` +
+          `<autoFilter ref="A1:${lastCol}${lastRow}"/></worksheet>`;
+        book = book.replace('</sheets>', `<sheet name="${xmlSafe(sheetName)}" sheetId="${sheetId}" r:id="${relId}"/></sheets>`);
+        rels = rels.replace('</Relationships>',
+          `<Relationship Id="${relId}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet${sheetFileN}.xml"/></Relationships>`);
+        types = types.replace('</Types>',
+          `<Override PartName="${sheetPath}" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/></Types>`);
+        put('/xl/workbook.xml', book);
+        put('/xl/_rels/workbook.xml.rels', rels);
+        put('/[Content_Types].xml', types);
+        put(sheetPath, sheetXml);
+        // Atualiza também o número/nome das abas no resumo de propriedades do Excel.
+        const propsEntry = XLSX.CFB.find(zip, '/docProps/app.xml');
+        if (propsEntry && propsEntry.content) {
+          let app = new TextDecoder('utf-8').decode(propsEntry.content);
+          app = app.replace(/(<HeadingPairs>[\s\S]*?<vt:i4>)(\d+)(<\/vt:i4>)/,
+            (_, a, qty, b) => a + (Number(qty) + 1) + b);
+          app = app.replace(/(<TitlesOfParts>\s*<vt:vector\b[^>]*\bsize=")(\d+)("[^>]*>)([\s\S]*?)(<\/vt:vector>)/,
+            (_, a, count, b, children, close) => a + (Number(count) + 1) + b + children +
+              `<vt:lpstr>${xmlSafe(sheetName)}</vt:lpstr>` + close);
+          put('/docProps/app.xml', app);
+        }
+        return XLSX.CFB.write(zip, { type: 'array', fileType: 'zip', compression: true });
+      }
+
       async function exportRosterXlsx() {
         if (!ROSTER.bytes || !ROSTER.sheet) {
           await ask('Esta lista foi importada em uma versão antiga do app e o arquivo original não está salvo. Recarregue a planilha de inscritos para exportá-la com as notas.', 'Ok', false, '');
@@ -3757,7 +3853,8 @@
           let out;
           if (/\.xlsx$/i.test(ROSTER.file) && XLSX.CFB && XLSX.CFB.utils.cfb_add) {
             // Para .xlsx, altera só o XML da aba alvo e mantém a formatação original.
-            out = addGradeColumnToXlsx(ROSTER.bytes, ROSTER.sheet, hr, nextCol, chosen);
+            const graded = addGradeColumnToXlsx(ROSTER.bytes, ROSTER.sheet, hr, nextCol, chosen);
+            out = addResultsSheetToXlsx(graded, buildResultRows());
           } else {
             // Planilhas .xls e arquivos .csv são convertidos para .xlsx.
             const sourceHeader = ws[XLSX.utils.encode_cell({ r: hr, c: range.e.c })];
@@ -3771,6 +3868,15 @@
             ws['!ref'] = XLSX.utils.encode_range(range);
             if (!ws['!cols']) ws['!cols'] = [];
             ws['!cols'][nextCol] = { wch: 12 };
+            const resultRows = buildResultRows();
+            const resultWs = XLSX.utils.aoa_to_sheet(resultRows);
+            resultWs['!cols'] = [{ wch: 38 }, { wch: 17 }, { wch: 10 }, { wch: 10 },
+              { wch: 13 }, { wch: 14 }, { wch: 42 }, { wch: 26 }]
+              .concat(Array(NQ).fill({ wch: 12 }));
+            let resultSheetName = 'Resultados', seq = 2;
+            while (wb.SheetNames.some(n => n.toLocaleLowerCase() === resultSheetName.toLocaleLowerCase()))
+              resultSheetName = `Resultados (${seq++})`;
+            XLSX.utils.book_append_sheet(wb, resultWs, resultSheetName);
             out = XLSX.write(wb, { bookType: 'xlsx', type: 'array', cellStyles: true });
           }
           const base = ROSTER.file.replace(/\.(xlsx|xls|csv)$/i, '');
@@ -3792,14 +3898,7 @@
         if (ROSTER.list) return exportRosterXlsx();
         if (!S.cards.length) return toast('Nenhum cartão ainda');
         try { await loadLib('xlsx'); } catch (e) { return toast(e.message, 4000); }
-        const head = ['Nome', 'CPF', 'Acertos', 'Nota', 'Situação', 'Revisão', 'Alertas', 'Lista de inscritos'].concat(Array.from({ length: NQ }, (_, i) => 'Q' + (i + 1)));
-        const rows = [head];
-        for (const c of sortedCards()) {
-          const sc = cardScore(c);
-          rows.push([c.name || '', c.cpf || '', c.aus ? '' : sc, c.aus ? '' : Math.round(sc / NQ * S.cfg.max * 100) / 100,
-          c.aus ? 'Ausente' : c.eli ? 'Eliminado' : 'Presente', c.rev ? 'Revisado' : (alertsOf(c).length ? 'Pendente' : 'Sem alertas'), alertsOf(c).join(' | '), ROSTER.list && c.roster ? ROSTER_TXT[c.roster.status] : '']
-            .concat(c.ans.map((a, q) => isDouble(c, q) ? (S.gab[q] === 5 ? 'DUPLA (anulada: ponto)' : 'DUPLA (0)') : a >= 0 ? LET[a] : '')));
-        }
+        const rows = buildResultRows();
         const ws = XLSX.utils.aoa_to_sheet(rows);
         ws['!cols'] = [{ wch: 38 }, { wch: 16 }, { wch: 9 }, { wch: 8 }, { wch: 11 }, { wch: 12 }, { wch: 36 }, { wch: 22 }].concat(Array(NQ).fill({ wch: 12 }));
         for (let r = 1; r < rows.length; r++) { const cell = ws[XLSX.utils.encode_cell({ r, c: 3 })]; if (cell && typeof cell.v === 'number') cell.z = '0.00'; }
@@ -4008,10 +4107,10 @@
         const n = S.cards.length, rev = S.cards.filter(needsReview).length;
         $('#v-exp').innerHTML = `<h2 style="margin-top:8px">Exportar</h2>
   <div class="note">${n} cartão(ões) gravados${rev ? ` · <b>${rev}</b> ainda com alerta de revisão` : ''}. Você pode exportar a qualquer momento com o que já foi corrigido.</div>
-  <div class="row" style="flex-direction:column;align-items:stretch;margin:12px 0"><button class="btn pri" data-act="xlsx">${ROSTER.list ? 'Planilha dos inscritos (.xlsx) com nova coluna Nota' : 'Planilha (.xlsx): nome, CPF, acertos, nota, respostas'}</button>
+  <div class="row" style="flex-direction:column;align-items:stretch;margin:12px 0"><button class="btn pri" data-act="xlsx">${ROSTER.list ? 'Planilha de inscritos com notas e aba Resultados (.xlsx)' : 'Planilha (.xlsx): nome, CPF, acertos, nota, respostas'}</button>
   <button class="btn" data-act="pdfx">PDF com todos os cartões anotados</button>
   <button class="btn" data-act="pdffreq">Gráficos de frequência por questão</button></div>
-  ${ROSTER.list ? `<div class="note" style="margin:-3px 0 12px">A exportação mantém as abas, colunas e a ordem do arquivo <b>${esc(ROSTER.file)}</b>, acrescentando apenas <b>Nota</b>. A identificação usa CPF único; registros ausentes, sem correspondência ou ambíguos ficam sem nota.${!ROSTER.bytes ? '<br><b>Recarregue a lista</b> para recuperar o arquivo original e liberar essa exportação.' : ''}</div>` : ''}
+  ${ROSTER.list ? `<div class="note" style="margin:-3px 0 12px">A exportação mantém as abas, colunas e a ordem do arquivo <b>${esc(ROSTER.file)}</b>, acrescentando <b>Nota</b> na lista e criando a aba <b>Resultados</b> com acertos e respostas Q1–Q30. A identificação usa CPF único; registros ausentes, sem correspondência ou ambíguos ficam sem nota.${!ROSTER.bytes ? '<br><b>Recarregue a lista</b> para recuperar o arquivo original e liberar essa exportação.' : ''}</div>` : ''}
   <div class="note">No PDF, cada página é o cartão do aluno com ✓ azul nos acertos, ✗ vermelho nos erros (a resposta certa aparece ao lado), 0 laranja nas questões zeradas por dupla marcação e o total no campo "Total de acertos na prova".</div>
   <h2>${apiOn() ? 'Dados no servidor' : 'Dados neste aparelho'}</h2>
   <div class="note">${apiOn() ? 'Os PDFs enviados, os cartões, as correções da revisão e as planilhas exportadas são salvos no servidor. Apagar um cartão aqui também o apaga no servidor.' : 'Os cartões e as notas ficam só neste navegador. Se limpar os dados do navegador, eles somem, então exporte antes.'}</div>
