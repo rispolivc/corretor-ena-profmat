@@ -1752,9 +1752,48 @@
          sem deformacoes. Usa transformacao com eixos ortogonais (sem cisalhamento). */
       function findScanGrid(cands) {
         const tc = TPL.map(t=>[t.x+t.w/2,t.y+t.h/2]);
-        const left=cands.filter(p=>p.X>tc[0][0]-90 && p.X<tc[0][0]+90 && p.Y>tc[0][1]-45 && p.Y<tc[14][1]+45);
-        const right=cands.filter(p=>p.X>tc[15][0]-90 && p.X<tc[15][0]+90 && p.Y>tc[15][1]-45 && p.Y<tc[29][1]+45);
+        // Concentra as referencias em uma faixa vertical por coluna. Na UnB
+        // outros retangulos preenchidos podem formar componentes com a mesma
+        // largura dos numeros; nao devem se misturar com as referencias.
+        const cluster = (points, expectedX) => {
+          let best=[],rank=-Infinity;
+          for (const pivot of points) {
+            const group=points.filter(p=>Math.abs(p.X-pivot.X)<=27);
+            const unique = new Set(group.map(p=>Math.round(p.Y/22))).size;
+            const medX=group.reduce((a,p)=>a+p.X,0)/(group.length||1);
+            const score=unique*100+group.length*5-Math.abs(medX-expectedX)*0.12;
+            if(score>rank){best=group;rank=score;}
+          }
+          return best;
+        };
+        const left=cluster(cands.filter(p=>p.X>tc[0][0]-90 && p.X<tc[0][0]+90 && p.Y>tc[0][1]-75 && p.Y<tc[14][1]+65),tc[0][0]);
+        const right=cluster(cands.filter(p=>p.X>tc[15][0]-90 && p.X<tc[15][0]+90 && p.Y>tc[15][1]-75 && p.Y<tc[29][1]+65),tc[15][0]);
         if(left.length<6 || right.length<6)return null;
+        /* Caso comum nas digitalizadoras: os 15 quadrados de cada coluna foram
+           encontrados. A ordem vertical identifica Q1..Q15 e Q16..Q30 de forma
+           INEQUIVOCA. Nao devemos procurar primeiro a maior sobreposicao por
+           deslocamento: se todas as linhas sobem uma posicao, 28/30 quadros
+           ainda coincidem, mas as notas ficam erradas. */
+        if (left.length === 15 && right.length === 15) {
+          const L = left.slice().sort((a,b) => a.Y-b.Y);
+          const R = right.slice().sort((a,b) => a.Y-b.Y);
+          const dst = L.concat(R).map(p => [p.X,p.Y]);
+          const rigid = fitScanRigid(tc, dst);
+          if (rigid) {
+            const err = fitResidual(rigid,tc,dst);
+            const firstPitchL = (L[14].Y-L[0].Y)/14, firstPitchR = (R[14].Y-R[0].Y)/14;
+            const minGap = a => Math.min(...a.slice(1).map((p,i)=>p.Y-a[i].Y));
+            const maxGap = a => Math.max(...a.slice(1).map((p,i)=>p.Y-a[i].Y));
+            // Somente sequencias regularmente espacadas podem receber indices por ordem.
+            // Se houver ruido/extravio de um quadrado, recorre ao encaixe geral.
+            if (err.max <= 6.5 && firstPitchL > 35 && firstPitchL < 47 &&
+                firstPitchR > 35 && firstPitchR < 47 &&
+                minGap(L)>30 && maxGap(L)<53 && minGap(R)>30 && maxGap(R)<53) {
+              const found = L.concat(R).map(p=>({x:p.X,y:p.Y}));
+              return { inliers:30, R:rigid, found, ncand:cands.length, scan:true, anchored:true };
+            }
+          }
+        }
         // Inclinacao das colunas, medida sem usar os numeros de linha: evita
         // combinar Q2 (se Q1 nao foi detectada) com Q16.
         const ordered=right.slice().sort((a,b)=>a.Y-b.Y);
@@ -1998,6 +2037,45 @@
         }
         return n ? mx : 1e9;
       }
+      /* Avalia a geometria em toda a folha, nao apenas no bloco de respostas.
+         Usado SOMENTE para uma eventual homografia de recuperacao de scanner.
+         Impede que as 30 referencias inferiores validem uma extrapolacao
+         distorcida do cabecalho, como ocorreu nos cartoes da PUC-Rio. */
+      function scanWarpIsSafe(H, sw, sh) {
+        const mid=(x,y)=>apply3(H,x,y), ox=mid(CW/2,CH/2),
+              ex=mid(CW/2+120,CH/2), ey=mid(CW/2,CH/2+120);
+        const vx=[ex[0]-ox[0],ex[1]-ox[1]], vy=[ey[0]-ox[0],ey[1]-ox[1]];
+        const nx=Math.hypot(...vx),ny=Math.hypot(...vy);
+        if(!isFinite(nx+ny)||nx<1||ny<1) return false;
+        // Eixos quase ortogonais: cisalhamento real pequeno pode existir,
+        // mas grandes inclinacoes artificiais nao sao aceitas.
+        if(Math.abs(vx[0]*vy[0]+vx[1]*vy[1])/(nx*ny)>0.025) return false;
+        const sx=nx/(120*sw/CW), sy=ny/(120*sh/CH);
+        if(sx<0.86||sx>1.12||sy<0.86||sy>1.12)return false;
+        const T=[mid(0,0),mid(CW,0),mid(CW,CH),mid(0,CH)];
+        const affine=fitAffine([[0,0],[CW,0],[CW,CH],[0,CH], [CW/2,CH/2]],
+                               [...T,ox]);
+        if(!affine)return false;
+        // Perspectiva precisa ser suave: divergencia maxima 15 px na pagina.
+        for(let i=0;i<4;i++) {
+          const x=(i===0||i===3)?0:CW, y=(i>=2)?CH:0;
+          const projected=apply3(affine,x,y);
+          if(Math.hypot(T[i][0]-projected[0],T[i][1]-projected[1])>15)return false;
+        }
+        return true;
+      }
+      function markerGood(found, maxResidual, minCount) {
+        const ds=[];
+        for(let q=0;q<NQ;q++)if(found?.[q]){
+          const t=TPL[q];ds.push(Math.hypot(found[q].x-(t.x+t.w/2),found[q].y-(t.y+t.h/2)));
+        }
+        if(ds.length<minCount)return false;
+        ds.sort((a,b)=>a-b);
+        return ds[ds.length-1]<=maxResidual ||
+          // Uma referencia pode ter o centro mal segmentado; nao rejeitar 29
+          // referencias boas por um unico outlier de poucos pixels.
+          (ds.length>=29 && ds[ds.length-1]<=8 && ds[Math.floor(0.90*(ds.length-1))]<=3.75);
+      }
       function processSource(src, sw, sh, cands, opts) {
         opts = opts || {};
         const diag = []; let weak = null;
@@ -2026,7 +2104,9 @@
           const res = markerResidual(f.found);
           const r = { ok: true, H, header: warpHeader(src, sw, sh, H, 2), ocr: (typeof ocrFromSource === 'function' ? ocrFromSource(src, sw, sh, H) : null), inliers: f.inliers, found: f.found || new Array(NQ).fill(null), rgba: cur.rgba, gray: cur.gray, via: c.name, diag, resid: res };
           // Só aceita o encaixe se os quadrados caírem onde o modelo manda; senão tenta o próximo método.
-          if (res <= MARK_RESID_MAX && f.inliers >= 22) return r;
+          const phaseSuspicious = opts.scanOnly &&
+            ((!f.found?.[0] && !f.found?.[15]) || (!f.found?.[14] && !f.found?.[29]));
+          if (!phaseSuspicious && f.inliers >= 22 && markerGood(f.found, MARK_RESID_MAX, 22)) return r;
           if (f.inliers >= 22 && (!weak || res < weak.resid)) weak = r;   // encaixe duvidoso, mas ainda com quadrados suficientes
         }
         return { ok: false, diag, weak };
@@ -3539,11 +3619,22 @@
         const keep = x => { if (x && x.weak && (!weakBest || x.weak.resid < weakBest.resid)) weakBest = x.weak; return x; };
         if (hint) { r = keep(processSource(data, w, h, [hint])); if (r.ok) return r; }
         if (mode === 'scan') {
-          // Digitalizadora de mesa: APENAS rotações pequenas, escala horizontal/
-          // vertical de normalização A4 e deslocamento. Sem homografia nem
-          // cisalhamento. Se o encaixe falhar, não produz nota insegura.
+          // 1) Scanner: prioriza rotação/translação/escalas ortogonais.
+          // A fase da grade (Q1, Q2, ...) agora e ancorada nas 15 linhas
+          // ordenadas, evitando deslocamento de uma questão na UnB.
           r = processSource(data, w, h, directCandidates(w, h), { scanOnly: true });
           if (r.ok) return r;
+          // 2) Recuperacao extraordinaria: algumas folhas podem apresentar
+          // distorcoes geometricas leves. Permite afim/homografia APENAS
+          // quando o alinhamento rigido falha e a geometria da folha inteira
+          // continua fisicamente plausivel (sem cisalhamento artificial).
+          for (const cand of directCandidates(w,h)) {
+            const alt = processSource(data,w,h,[cand],{scanOnly:false});
+            const phaseSuspicious = alt.ok &&
+              ((!alt.found[0] && !alt.found[15]) || (!alt.found[14] && !alt.found[29]));
+            if (alt.ok && !phaseSuspicious && alt.inliers>=26 && alt.resid<=4.5 &&
+                scanWarpIsSafe(alt.H,w,h) && markerGood(alt.found,4.5,26)) return alt;
+          }
           const best = Math.max(0, ...(r.diag || []).map(d => +(String(d).split(':')[1]) || 0));
           return { ok: false, why: best
             ? `alinhamento de scanner não confiável (${best}/30 quadrados); confira resolução, rotação e enquadramento da página`
