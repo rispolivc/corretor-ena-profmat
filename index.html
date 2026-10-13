@@ -3175,7 +3175,7 @@
         <li>Se tiver, carregue a lista de inscritos (.xlsx com nome e CPF). Ela ajuda a confirmar nome e CPF.</li>
         <li>Carregue o PDF. O app lê as marcações, o nome e o CPF e calcula a nota.</li>
         <li>Abra os cartões com a etiqueta "Revisar", corrija o que for preciso e toque em "Marcar revisado".</li>
-        <li>Exporte a planilha e o PDF anotado na aba Exportar.</li>
+        <li>Se carregou a lista de inscritos, a exportação adiciona a coluna Nota a uma cópia dela. Sem lista, exporta nome, CPF, acertos e respostas como antes. O PDF anotado fica na aba Exportar.</li>
       </ol>
       <p style="margin:0 0 6px"><b>O que pede revisão</b></p>
       <ul style="margin:0 0 12px;padding-left:20px;line-height:1.45">
@@ -3236,7 +3236,7 @@
          Sempre que encontra um inscrito correspondente, o app aplica nome e CPF da lista automaticamente;
          o usuário revisa e, se estiver errado, reverte para o que foi lido no cartão.
          Os alertas de leitura de nome e CPF continuam valendo: a lista só acrescenta informação e avisos. */
-      const ROSTER = { list: null, file: '', byCpf: new Map() };
+      const ROSTER = { list: null, file: '', byCpf: new Map(), bytes: null, sheet: '', headerRow: 0 };
       const normName = s => (s || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toUpperCase().replace(/[^A-Z ]/g, ' ').replace(/\s+/g, ' ').trim();
       function lev(a, b) {
         const m = a.length, n = b.length; if (!m) return n; if (!n) return m;
@@ -3246,17 +3246,33 @@
       }
       function nameSim(a, b) { a = normName(a); b = normName(b); if (!a || !b) return 0; return 1 - lev(a, b) / Math.max(a.length, b.length); }
       function setRoster(r) {
-        ROSTER.list = r ? r.list : null; ROSTER.file = r ? r.file : ''; ROSTER.byCpf = new Map();
-        if (ROSTER.list) for (const e of ROSTER.list) ROSTER.byCpf.set(e.cpf, e);
+        ROSTER.list = r ? r.list : null;
+        ROSTER.file = r ? r.file : '';
+        // Mantém o arquivo original em IndexedDB para exportar a MESMA planilha com notas.
+        ROSTER.bytes = r ? (r.bytes || null) : null;
+        ROSTER.sheet = r ? (r.sheet || '') : '';
+        ROSTER.headerRow = r && Number.isInteger(r.headerRow) ? r.headerRow : 0;
+        ROSTER.byCpf = new Map();
+        if (ROSTER.list) for (const e of ROSTER.list) {
+          // CPF repetido no cadastro nunca pode ser associado automaticamente.
+          ROSTER.byCpf.set(e.cpf, ROSTER.byCpf.has(e.cpf) ? null : e);
+        }
       }
       async function readRoster(file) {
         await loadLib('xlsx');
-        const wb = XLSX.read(await file.arrayBuffer(), { type: 'array' });
+        const bytes = await file.arrayBuffer();
+        const wb = XLSX.read(bytes, { type: 'array', cellStyles: true });
         const cpfOf = v => { if (typeof v === 'number') return String(Math.round(v)).padStart(11, '0'); let d = String(v || '').replace(/\D/g, ''); if (d.length >= 9 && d.length < 11) d = d.padStart(11, '0'); return d; };
         let best = null;
         for (const sn of wb.SheetNames) {
-          const rows = XLSX.utils.sheet_to_json(wb.Sheets[sn], { header: 1, raw: true, defval: '' }).filter(r => r.some(v => String(v).trim()));
-          if (!rows.length) continue;
+          const sheet = wb.Sheets[sn];
+          if (!sheet['!ref']) continue;
+          // Começa obrigatoriamente em A1 e preserva linhas em branco. Sem isso,
+          // a coluna de notas poderia ser escrita na linha de outro candidato.
+          const fullRange = XLSX.utils.decode_range(sheet['!ref']);
+          fullRange.s.r = 0; fullRange.s.c = 0;
+          const rows = XLSX.utils.sheet_to_json(sheet, { header: 1, raw: true, defval: '', blankrows: true, range: XLSX.utils.encode_range(fullRange) });
+          if (!rows.some(r => r.some(v => String(v).trim()))) continue;
           // cabeçalho com "CPF" e "Nome" nas primeiras linhas; senão, descobre as colunas pelo conteúdo
           let hr = -1, cc = -1, nc = -1;
           for (let i = 0; i < Math.min(15, rows.length) && hr < 0; i++) {
@@ -3278,18 +3294,19 @@
           for (let i = hr + 1; i < rows.length; i++) {
             const cpf = cpfOf(rows[i][cc]), nome = String(rows[i][nc] || '').replace(/\s+/g, ' ').trim();
             if (!cpf && !nome) continue;
-            if (cpf.length === 11 && cpfValido(cpf) && nome) list.push({ nome, cpf }); else bad.push(i + 1);
+            if (cpf.length === 11 && cpfValido(cpf) && nome) list.push({ nome, cpf, row: i }); else bad.push(i + 1);
           }
-          if (!best || list.length > best.list.length) best = { list, bad, sheet: sn };
+          if (!best || list.length > best.list.length) best = { list, bad, sheet: sn, headerRow: Math.max(0, hr), cpfCol: cc, nameCol: nc };
         }
         if (!best || !best.list.length) throw new Error('Não encontrei colunas de nome e CPF válidos neste arquivo.');
-        return { file: file.name, list: best.list, bad: best.bad, sheet: best.sheet };
+        return { file: file.name, bytes, ...best };
       }
       function matchRoster(cpfRead, nameRead) {
         if (!ROSTER.list) return null;
         const d = (cpfRead || '').replace(/\D/g, '');
         if (d.length >= 9) {
           const ex = ROSTER.byCpf.get(d);
+          if (ROSTER.byCpf.has(d) && !ex) return { status: 'ambiguo' }; // CPF duplicado na lista
           if (ex) { const sim = nameSim(nameRead, ex.nome); return { status: sim >= 0.75 || !normName(nameRead) ? 'exato' : 'nome-difere', e: ex, dist: 0, sim }; }
           const near = []; for (const e of ROSTER.list) { const k = lev(d, e.cpf); if (k <= 2) near.push({ e, dist: k }); }
           if (near.length) {
@@ -3628,7 +3645,151 @@
       }
       const slug = s => (s || 'prova').normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/[^\w\-]+/g, '_').replace(/^_+|_+$/g, '') || 'prova';
 
+      /* ================= Notas na planilha original dos inscritos =================
+         A importação mantém o .xlsx completo, a aba e o número da linha de cada CPF.
+         O lançamento é sempre por CPF único e confirmado, jamais pela posição ou por
+         semelhança de nome. Linhas sem correspondência ficam sem nota. */
+      function rosterGradeMatches() {
+        const counts = new Map(), rosterCounts = new Map(), chosen = new Map();
+        for (const e of ROSTER.list || []) rosterCounts.set(e.cpf, (rosterCounts.get(e.cpf) || 0) + 1);
+        for (const c of S.cards) {
+          const cpf = (c.cpf || '').replace(/\D/g, '');
+          if (cpf) counts.set(cpf, (counts.get(cpf) || 0) + 1);
+        }
+        let pending = 0, absent = 0, repeated = 0;
+        for (const c of S.cards) {
+          const cpf = (c.cpf || '').replace(/\D/g, '');
+          if (c.aus) { absent++; continue; }
+          if (!cpfValido(cpf) || !ROSTER.byCpf.has(cpf)) { pending++; continue; }
+          if ((counts.get(cpf) || 0) !== 1 || (rosterCounts.get(cpf) || 0) !== 1) { repeated++; continue; }
+          const candidate = ROSTER.byCpf.get(cpf);
+          if (!candidate || !Number.isInteger(candidate.row)) { pending++; continue; }
+          // Identidade não exata requer revisão ou edição manual explícita.
+          // Uma sugestão de OCR por CPF parecido/nome não deve passar direto à nota.
+          const status = c.roster && c.roster.status;
+          if (status === 'ambiguo' || (status !== 'exato' && !c.rev && !c.idManual)) { pending++; continue; }
+          if (c.roster && c.roster.cpf && c.roster.cpf !== cpf) { pending++; continue; }
+          const note = Math.round(cardScore(c) / NQ * S.cfg.max * 100) / 100;
+          chosen.set(cpf, { row: candidate.row, note });
+        }
+        return { chosen, pending, absent, repeated };
+      }
+      // Acrescenta células diretamente ao pacote OOXML, sem reescrever as células
+      // e os estilos existentes. Assim os títulos, os filtros, a formatação, as
+      // demais abas e metadados continuam iguais aos da planilha fornecida.
+      function addGradeColumnToXlsx(bytes, sheetName, headerRow, noteCol, selected) {
+        const zip = XLSX.CFB.read(new Uint8Array(bytes), { type: 'array' });
+        const getPart = path => {
+          const entry = XLSX.CFB.find(zip, path);
+          if (!entry || !entry.content) throw new Error('Arquivo Excel incompleto: ' + path);
+          return entry;
+        };
+        const decode = path => new TextDecoder('utf-8').decode(getPart(path).content);
+        const attr = (tag, key) => {
+          const m = tag.match(new RegExp('(?:\\s|^)'+key.replace(':', '\\:')+'="([^"]*)"'));
+          return m ? m[1] : '';
+        };
+        const unxml = value => value.replace(/&quot;/g, '"').replace(/&apos;|&#39;|&#039;/g, "'").replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&');
+        const bookXml = decode('/xl/workbook.xml');
+        const sheetTag = [...bookXml.matchAll(/<sheet\b[^>]*>/g)].map(m => m[0]).find(tag => unxml(attr(tag, 'name')) === sheetName);
+        if (!sheetTag) throw new Error('A aba da lista não aparece no arquivo original.');
+        const relId = attr(sheetTag, 'r:id');
+        const relXml = decode('/xl/_rels/workbook.xml.rels');
+        const relTag = [...relXml.matchAll(/<Relationship\b[^>]*>/g)].map(m => m[0]).find(tag => attr(tag, 'Id') === relId);
+        if (!relTag) throw new Error('Não foi possível localizar a planilha interna.');
+        const target = attr(relTag, 'Target');
+        if (!target || target.includes('..')) throw new Error('Endereço interno da aba inválido.');
+        const worksheetPath = target.startsWith('/') ? target : '/xl/' + target.replace(/^xl\//, '');
+        const entry = getPart(worksheetPath);
+        let xml = decode(worksheetPath);
+        const colLabel = XLSX.utils.encode_col(noteCol);
+        const cellOf = row => colLabel + row;
+        const notes = new Map([...selected.values()].map(e => [e.row + 1, e.note]));
+        let headerDone = false;
+        xml = xml.replace(/<row\b([^>]*?)(?<!\/)>([\s\S]*?)<\/row>/g, (whole, attributes, inside) => {
+          const rm = attributes.match(/\br="(\d+)"/);
+          if (!rm) return whole;
+          const rowNumber = Number(rm[1]);
+          let next = '';
+          if (rowNumber === headerRow + 1) {
+            if (inside.includes(`r="${cellOf(rowNumber)}"`)) throw new Error('A coluna de notas já possui conteúdo.');
+            const style = inside.match(/<c\b[^>]*\bs="(\d+)"/);
+            next = `<c r="${cellOf(rowNumber)}"${style ? ' s="' + style[1] + '"' : ''} t="inlineStr"><is><t>Nota</t></is></c>`;
+            headerDone = true;
+          } else if (notes.has(rowNumber)) {
+            if (inside.includes(`r="${cellOf(rowNumber)}"`)) throw new Error('A coluna de notas já possui conteúdo.');
+            const note = notes.get(rowNumber);
+            if (!Number.isFinite(note)) throw new Error('Foi encontrada uma nota inválida.');
+            next = `<c r="${cellOf(rowNumber)}" t="n"><v>${note}</v></c>`;
+            notes.delete(rowNumber);
+          }
+          return next ? `<row${attributes}>${inside}${next}</row>` : whole;
+        });
+        if (!headerDone) throw new Error('A linha do cabeçalho não existe no arquivo.');
+        if (notes.size) throw new Error('Uma ou mais linhas dos candidatos não foram encontradas.');
+        xml = xml.replace(/(<dimension\b[^>]*\bref=")[^"]+("?)/, (all, a, b) => {
+          const m = all.match(/ref="([^"]+)"/);
+          if (!m) return all;
+          const range = XLSX.utils.decode_range(m[1]);
+          range.e.c = Math.max(range.e.c, noteCol);
+          return all.replace(m[1], XLSX.utils.encode_range(range));
+        });
+        if (/<\/cols>/.test(xml)) xml = xml.replace(/<\/cols>/, `<col min="${noteCol + 1}" max="${noteCol + 1}" width="12" customWidth="1"/></cols>`);
+        XLSX.CFB.utils.cfb_add(zip, worksheetPath, new TextEncoder().encode(xml));
+        return XLSX.CFB.write(zip, { type: 'array', fileType: 'zip', compression: true });
+      }
+
+      async function exportRosterXlsx() {
+        if (!ROSTER.bytes || !ROSTER.sheet) {
+          await ask('Esta lista foi importada em uma versão antiga do app e o arquivo original não está salvo. Recarregue a planilha de inscritos para exportá-la com as notas.', 'Ok', false, '');
+          return;
+        }
+        try { await loadLib('xlsx'); } catch (e) { return toast(e.message, 4000); }
+        try {
+          const wb = XLSX.read(ROSTER.bytes, { type: 'array', cellStyles: true });
+          const ws = wb.Sheets[ROSTER.sheet];
+          if (!ws || !ws['!ref']) throw new Error('Não foi possível localizar a aba original da lista de inscritos.');
+          const range = XLSX.utils.decode_range(ws['!ref']);
+          const nextCol = range.e.c + 1;
+          const hr = ROSTER.headerRow;
+          const hc = XLSX.utils.encode_cell({ r: hr, c: nextCol });
+          const { chosen, pending, absent, repeated } = rosterGradeMatches();
+          let out;
+          if (/\.xlsx$/i.test(ROSTER.file) && XLSX.CFB && XLSX.CFB.utils.cfb_add) {
+            // Para .xlsx, altera só o XML da aba alvo e mantém a formatação original.
+            out = addGradeColumnToXlsx(ROSTER.bytes, ROSTER.sheet, hr, nextCol, chosen);
+          } else {
+            // Planilhas .xls e arquivos .csv são convertidos para .xlsx.
+            const sourceHeader = ws[XLSX.utils.encode_cell({ r: hr, c: range.e.c })];
+            ws[hc] = { t: 's', v: 'Nota' };
+            if (sourceHeader && sourceHeader.s != null) ws[hc].s = sourceHeader.s;
+            for (const { row, note } of chosen.values()) {
+              const cell = XLSX.utils.encode_cell({ r: row, c: nextCol });
+              ws[cell] = { t: 'n', v: note, z: '0.00' };
+            }
+            range.e.c = nextCol;
+            ws['!ref'] = XLSX.utils.encode_range(range);
+            if (!ws['!cols']) ws['!cols'] = [];
+            ws['!cols'][nextCol] = { wch: 12 };
+            out = XLSX.write(wb, { bookType: 'xlsx', type: 'array', cellStyles: true });
+          }
+          const base = ROSTER.file.replace(/\.(xlsx|xls|csv)$/i, '');
+          const filename = `${base}_notas.xlsx`;
+          const blob = new Blob([out], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
+          uploadExport(filename, blob, 'planilha');
+          if (await saveFile(filename, blob)) {
+            const omitted = pending + repeated;
+            const warning = omitted ? ` ${omitted} cartão(ões) sem lançamento seguro: revise identificação e CPFs repetidos.` : '';
+            toast(`${chosen.size} nota(s) lançada(s).${warning}`, omitted ? 6500 : 3500);
+          }
+        } catch (e) {
+          console.error('Falha ao exportar a planilha original', e);
+          await ask('Não foi possível exportar a planilha de inscritos com as notas: ' + esc(e.message), 'Ok', false, '');
+        }
+      }
+
       async function exportXlsx() {
+        if (ROSTER.list) return exportRosterXlsx();
         if (!S.cards.length) return toast('Nenhum cartão ainda');
         try { await loadLib('xlsx'); } catch (e) { return toast(e.message, 4000); }
         const head = ['Nome', 'CPF', 'Acertos', 'Nota', 'Situação', 'Revisão', 'Alertas', 'Lista de inscritos'].concat(Array.from({ length: NQ }, (_, i) => 'Q' + (i + 1)));
@@ -3847,9 +4008,10 @@
         const n = S.cards.length, rev = S.cards.filter(needsReview).length;
         $('#v-exp').innerHTML = `<h2 style="margin-top:8px">Exportar</h2>
   <div class="note">${n} cartão(ões) gravados${rev ? ` · <b>${rev}</b> ainda com alerta de revisão` : ''}. Você pode exportar a qualquer momento com o que já foi corrigido.</div>
-  <div class="row" style="flex-direction:column;align-items:stretch;margin:12px 0"><button class="btn pri" data-act="xlsx">Planilha (.xlsx): nome, CPF, acertos, nota, respostas</button>
+  <div class="row" style="flex-direction:column;align-items:stretch;margin:12px 0"><button class="btn pri" data-act="xlsx">${ROSTER.list ? 'Planilha dos inscritos (.xlsx) com nova coluna Nota' : 'Planilha (.xlsx): nome, CPF, acertos, nota, respostas'}</button>
   <button class="btn" data-act="pdfx">PDF com todos os cartões anotados</button>
   <button class="btn" data-act="pdffreq">Gráficos de frequência por questão</button></div>
+  ${ROSTER.list ? `<div class="note" style="margin:-3px 0 12px">A exportação mantém as abas, colunas e a ordem do arquivo <b>${esc(ROSTER.file)}</b>, acrescentando apenas <b>Nota</b>. A identificação usa CPF único; registros ausentes, sem correspondência ou ambíguos ficam sem nota.${!ROSTER.bytes ? '<br><b>Recarregue a lista</b> para recuperar o arquivo original e liberar essa exportação.' : ''}</div>` : ''}
   <div class="note">No PDF, cada página é o cartão do aluno com ✓ azul nos acertos, ✗ vermelho nos erros (a resposta certa aparece ao lado), 0 laranja nas questões zeradas por dupla marcação e o total no campo "Total de acertos na prova".</div>
   <h2>${apiOn() ? 'Dados no servidor' : 'Dados neste aparelho'}</h2>
   <div class="note">${apiOn() ? 'Os PDFs enviados, os cartões, as correções da revisão e as planilhas exportadas são salvos no servidor. Apagar um cartão aqui também o apaga no servidor.' : 'Os cartões e as notas ficam só neste navegador. Se limpar os dados do navegador, eles somem, então exporte antes.'}</div>
@@ -4168,7 +4330,8 @@
         else if (t.id === 'fRoster') {
           const file = t.files[0]; t.value = ''; if (!file) return;
           try {
-            const r = await readRoster(file); setRoster(r); await saveKV('roster', { file: r.file, list: r.list });
+            const r = await readRoster(file); setRoster(r);
+            await saveKV('roster', { file: r.file, list: r.list, sheet: r.sheet, headerRow: r.headerRow, bytes: r.bytes });
             const st = {}; for (const c of S.cards) { applyRoster(c); saveCard(c); st[c.roster.status] = (st[c.roster.status] || 0) + 1; }
             renderList();
             const resumo = S.cards.length ? `<br><br>Cartões já carregados: ${st.exato || 0} conferem${st.corrigido ? `, ${st.corrigido} com CPF corrigido` : ''}${st['nome-difere'] ? `, ${st['nome-difere']} com nome diferente` : ''}${st['por-nome'] ? `, ${st['por-nome']} identificados pelo nome` : ''}${st.ambiguo ? `, ${st.ambiguo} ambíguos` : ''}${st['nao-encontrado'] ? `, ${st['nao-encontrado']} fora da lista` : ''}.` : '<br><br>Os próximos PDFs carregados serão conferidos com ela.';
