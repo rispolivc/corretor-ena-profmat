@@ -2685,7 +2685,31 @@
       const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
       const sleep = ms => new Promise(r => setTimeout(r, ms));
       const tick = () => new Promise(r => setTimeout(r, 0));
-      const fmtCpf = v => (v || '').replace(/\D/g, '').slice(0, 11)
+      // CPF can come from an OCR field (punctuated) or from an Excel numeric cell.
+      // Normalize both to 11 digits, preserving omitted leading zeroes when valid.
+      // Never compare CPF as a number: identifiers are strings, not quantities.
+      function cpfDigits(value) {
+        if (value === null || value === undefined || value === '') return '';
+        let d;
+        if (typeof value === 'number') {
+          if (!Number.isSafeInteger(value) || value < 0 || value > 99999999999) return '';
+          d = String(value);
+        } else {
+          let str = String(value).trim();
+          // Some spreadsheet sources return an integer ending in .0 as a string.
+          if (/^\d{9,11}[.,]0+$/.test(str)) str = str.replace(/[.,]0+$/, '');
+          d = str.replace(/\D/g, '');
+        }
+        if (d.length === 11) return d;
+        if (d.length >= 9 && d.length < 11) {
+          const padded = d.padStart(11, '0');
+          return cpfValido(padded) ? padded : d;
+        }
+        return d;
+      }
+      // Keep partial digits while the user is typing in the CPF editor;
+      // zero-padding belongs to comparisons/imports, not interactive typing.
+      const fmtCpf = v => (typeof v === 'number' ? cpfDigits(v) : String(v ?? '').replace(/\D/g, '')).slice(0, 11)
         .replace(/^(\d{3})(\d)/, '$1.$2').replace(/^(\d{3})\.(\d{3})(\d)/, '$1.$2.$3').replace(/^(\d{3})\.(\d{3})\.(\d{3})(\d)/, '$1.$2.$3-$4');
       const fmtNum = (n, d = 1) => Number(n).toLocaleString('pt-BR', { minimumFractionDigits: d, maximumFractionDigits: d });
       const blobOf = (cv, type, q) => new Promise(r => cv.toBlob(r, type, q));
@@ -3236,7 +3260,7 @@
          Sempre que encontra um inscrito correspondente, o app aplica nome e CPF da lista automaticamente;
          o usuário revisa e, se estiver errado, reverte para o que foi lido no cartão.
          Os alertas de leitura de nome e CPF continuam valendo: a lista só acrescenta informação e avisos. */
-      const ROSTER = { list: null, file: '', byCpf: new Map(), bytes: null, sheet: '', headerRow: 0 };
+      const ROSTER = { list: null, file: '', byCpf: new Map(), bytes: null, sheet: '', headerRow: 0, cpfCol: null, nameCol: null };
       const normName = s => (s || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toUpperCase().replace(/[^A-Z ]/g, ' ').replace(/\s+/g, ' ').trim();
       function lev(a, b) {
         const m = a.length, n = b.length; if (!m) return n; if (!n) return m;
@@ -3246,12 +3270,15 @@
       }
       function nameSim(a, b) { a = normName(a); b = normName(b); if (!a || !b) return 0; return 1 - lev(a, b) / Math.max(a.length, b.length); }
       function setRoster(r) {
-        ROSTER.list = r ? r.list : null;
+        // Normalize records loaded from older app versions / IndexedDB as well.
+        ROSTER.list = r ? (r.list || []).map(e => ({ ...e, cpf: cpfDigits(e.cpf) })) : null;
         ROSTER.file = r ? r.file : '';
         // Mantém o arquivo original em IndexedDB para exportar a MESMA planilha com notas.
         ROSTER.bytes = r ? (r.bytes || null) : null;
         ROSTER.sheet = r ? (r.sheet || '') : '';
         ROSTER.headerRow = r && Number.isInteger(r.headerRow) ? r.headerRow : 0;
+        ROSTER.cpfCol = r && Number.isInteger(r.cpfCol) ? r.cpfCol : null;
+        ROSTER.nameCol = r && Number.isInteger(r.nameCol) ? r.nameCol : null;
         ROSTER.byCpf = new Map();
         if (ROSTER.list) for (const e of ROSTER.list) {
           // CPF repetido no cadastro nunca pode ser associado automaticamente.
@@ -3262,7 +3289,7 @@
         await loadLib('xlsx');
         const bytes = await file.arrayBuffer();
         const wb = XLSX.read(bytes, { type: 'array', cellStyles: true });
-        const cpfOf = v => { if (typeof v === 'number') return String(Math.round(v)).padStart(11, '0'); let d = String(v || '').replace(/\D/g, ''); if (d.length >= 9 && d.length < 11) d = d.padStart(11, '0'); return d; };
+        const cpfOf = cpfDigits;
         let best = null;
         for (const sn of wb.SheetNames) {
           const sheet = wb.Sheets[sn];
@@ -3303,7 +3330,7 @@
       }
       function matchRoster(cpfRead, nameRead) {
         if (!ROSTER.list) return null;
-        const d = (cpfRead || '').replace(/\D/g, '');
+        const d = cpfDigits(cpfRead);
         if (d.length >= 9) {
           const ex = ROSTER.byCpf.get(d);
           if (ROSTER.byCpf.has(d) && !ex) return { status: 'ambiguo' }; // CPF duplicado na lista
@@ -3331,9 +3358,10 @@
         c.roster = { status: m.status, nome: m.e ? m.e.nome : '', cpf: m.e ? m.e.cpf : '', dist: m.dist || 0, sim: m.sim != null ? Math.round(m.sim * 100) / 100 : null, applied: false };
         if (manual) return;
         c.cpf = c.ocrCpf; c.name = c.ocrName;
-        if (m.e) { c.cpf = fmtCpf(m.e.cpf); c.name = m.e.nome.toUpperCase(); c.roster.applied = true; }   // aplica sempre; o usuário revisa
+        // Ambiguous matching is a suggestion, not an automatic identity change.
+        if (m.e && m.status !== 'ambiguo') { c.cpf = fmtCpf(m.e.cpf); c.name = m.e.nome.toUpperCase(); c.roster.applied = true; }
       }
-      const ROSTER_TXT = { exato: 'Confere com a lista', corrigido: 'CPF corrigido pela lista', 'nome-difere': 'Nome substituído pelo da lista', 'por-nome': 'Identificado pelo nome', ambiguo: 'Inscrito mais provável aplicado', 'nao-encontrado': 'Não está na lista' };
+      const ROSTER_TXT = { exato: 'Confere com a lista', corrigido: 'CPF corrigido pela lista', 'nome-difere': 'Nome substituído pelo da lista', 'por-nome': 'Identificado pelo nome', ambiguo: 'Correspondência ambígua — revisar CPF', 'nao-encontrado': 'Não está na lista' };
       function rosterAlert(c) {
         const r = c.roster; if (!r || !ROSTER.list) return '';
         if (r.status === 'nao-encontrado') return 'CPF não está na lista de inscritos';
@@ -3649,28 +3677,76 @@
          A importação mantém o .xlsx completo, a aba e o número da linha de cada CPF.
          O lançamento é sempre por CPF único e confirmado, jamais pela posição ou por
          semelhança de nome. Linhas sem correspondência ficam sem nota. */
-      function rosterGradeMatches() {
+      // Confirm the target row by reading the actual CPF cells in the original
+      // workbook, rather than relying on stale row positions cached in IndexedDB.
+      function originalCpfRows(sheet) {
+        const range = XLSX.utils.decode_range(sheet['!ref']);
+        const hdr = ROSTER.headerRow;
+        const headers = [];
+        for (let c = range.s.c; c <= range.e.c; c++) {
+          const cell = sheet[XLSX.utils.encode_cell({ r: hdr, c })];
+          headers.push({ c, name: normName(String(cell ? cell.v : '')) });
+        }
+        let cpfColumn = headers.find(x => /\bCPF\b/.test(x.name))?.c;
+        if (cpfColumn == null && Number.isInteger(ROSTER.cpfCol)) cpfColumn = ROSTER.cpfCol;
+        if (cpfColumn == null) {
+          // Older saved rosters do not have cpfCol: infer from the actual cells.
+          let best = { c: -1, hits: 0 };
+          const known = new Set((ROSTER.list || []).map(e => cpfDigits(e.cpf)));
+          for (let c = range.s.c; c <= range.e.c; c++) {
+            let hits = 0;
+            for (let r = hdr + 1; r <= Math.min(range.e.r, hdr + 80); r++) {
+              const cell = sheet[XLSX.utils.encode_cell({ r, c })];
+              if (cell && known.has(cpfDigits(cell.v))) hits++;
+            }
+            if (hits > best.hits) best = { c, hits };
+          }
+          if (best.hits > 0) cpfColumn = best.c;
+        }
+        if (cpfColumn == null) throw new Error('Não foi possível identificar a coluna de CPF na planilha original. Recarregue a lista.');
+        const byCpf = new Map();
+        let valid = 0, duplicates = 0;
+        for (let r = hdr + 1; r <= range.e.r; r++) {
+          const cell = sheet[XLSX.utils.encode_cell({ r, c: cpfColumn })];
+          const cpf = cell ? cpfDigits(cell.v) : '';
+          if (!cpfValido(cpf)) continue;
+          valid++;
+          if (byCpf.has(cpf)) { byCpf.set(cpf, null); duplicates++; }
+          else byCpf.set(cpf, r);
+        }
+        if (!valid) throw new Error('Não encontrei CPFs válidos na aba original. Confira a coluna de CPF.');
+        return { byCpf, valid, duplicates };
+      }
+      function rosterGradeMatches(originalRows) {
         const counts = new Map(), rosterCounts = new Map(), chosen = new Map();
-        for (const e of ROSTER.list || []) rosterCounts.set(e.cpf, (rosterCounts.get(e.cpf) || 0) + 1);
+        for (const e of ROSTER.list || []) {
+          const cpf = cpfDigits(e.cpf);
+          if (cpf) rosterCounts.set(cpf, (rosterCounts.get(cpf) || 0) + 1);
+        }
         for (const c of S.cards) {
-          const cpf = (c.cpf || '').replace(/\D/g, '');
+          const cpf = cpfDigits(c.cpf);
           if (cpf) counts.set(cpf, (counts.get(cpf) || 0) + 1);
         }
         let pending = 0, absent = 0, repeated = 0;
         for (const c of S.cards) {
-          const cpf = (c.cpf || '').replace(/\D/g, '');
+          const cpf = cpfDigits(c.cpf);
           if (c.aus) { absent++; continue; }
-          if (!cpfValido(cpf) || !ROSTER.byCpf.has(cpf)) { pending++; continue; }
+          if (!cpfValido(cpf) || !ROSTER.byCpf.has(cpf) || !originalRows.byCpf.has(cpf)) { pending++; continue; }
           if ((counts.get(cpf) || 0) !== 1 || (rosterCounts.get(cpf) || 0) !== 1) { repeated++; continue; }
           const candidate = ROSTER.byCpf.get(cpf);
-          if (!candidate || !Number.isInteger(candidate.row)) { pending++; continue; }
-          // Identidade não exata requer revisão ou edição manual explícita.
-          // Uma sugestão de OCR por CPF parecido/nome não deve passar direto à nota.
+          const row = originalRows.byCpf.get(cpf);
+          if (!candidate || !Number.isInteger(row)) { repeated++; continue; }
+          // A unique, checksum-valid CPF read directly from the card is exact even
+          // when the name OCR differs. Fuzzy CPF/name substitutions still require
+          // explicit review before grades are written.
           const status = c.roster && c.roster.status;
-          if (status === 'ambiguo' || (status !== 'exato' && !c.rev && !c.idManual)) { pending++; continue; }
-          if (c.roster && c.roster.cpf && c.roster.cpf !== cpf) { pending++; continue; }
+          const rawCpf = cpfDigits(c.ocrCpf === undefined ? c.cpf : c.ocrCpf);
+          const directlyMatched = rawCpf === cpf && cpfValido(rawCpf);
+          const reviewed = !!(c.rev || c.idManual);
+          if (status === 'ambiguo' || (!directlyMatched && !reviewed)) { pending++; continue; }
+          if (c.roster && c.roster.cpf && cpfDigits(c.roster.cpf) !== cpf) { pending++; continue; }
           const note = Math.round(cardScore(c) / NQ * S.cfg.max * 100) / 100;
-          chosen.set(cpf, { row: candidate.row, note });
+          chosen.set(cpf, { row, note });
         }
         return { chosen, pending, absent, repeated };
       }
@@ -3812,7 +3888,7 @@
           `<sheetViews><sheetView workbookViewId="0"><pane xSplit="2" ySplit="1" topLeftCell="C2" activePane="bottomRight" state="frozen"/></sheetView></sheetViews>` +
           `<sheetFormatPr defaultRowHeight="15"/>${cols}<sheetData>${xmlRows}</sheetData>` +
           `<autoFilter ref="A1:${lastCol}${lastRow}"/></worksheet>`;
-        book = book.replace('</sheets>', `<sheet name="${xmlSafe(sheetName)}" sheetId="${sheetId}" r:id="${relId}"/></sheets>`);
+        book = book.replace('</sheets>', `<sheet name="${xmlSafe(sheetName)}" sheetId="${sheetId}" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" r:id="${relId}"/></sheets>`);
         rels = rels.replace('</Relationships>',
           `<Relationship Id="${relId}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet${sheetFileN}.xml"/></Relationships>`);
         types = types.replace('</Types>',
@@ -3849,7 +3925,8 @@
           const nextCol = range.e.c + 1;
           const hr = ROSTER.headerRow;
           const hc = XLSX.utils.encode_cell({ r: hr, c: nextCol });
-          const { chosen, pending, absent, repeated } = rosterGradeMatches();
+          const originalRows = originalCpfRows(ws);
+          const { chosen, pending, absent, repeated } = rosterGradeMatches(originalRows);
           let out;
           if (/\.xlsx$/i.test(ROSTER.file) && XLSX.CFB && XLSX.CFB.utils.cfb_add) {
             // Para .xlsx, altera só o XML da aba alvo e mantém a formatação original.
@@ -4430,7 +4507,8 @@
           const file = t.files[0]; t.value = ''; if (!file) return;
           try {
             const r = await readRoster(file); setRoster(r);
-            await saveKV('roster', { file: r.file, list: r.list, sheet: r.sheet, headerRow: r.headerRow, bytes: r.bytes });
+            await saveKV('roster', { file: r.file, list: r.list, sheet: r.sheet, headerRow: r.headerRow,
+              cpfCol: r.cpfCol, nameCol: r.nameCol, bytes: r.bytes });
             const st = {}; for (const c of S.cards) { applyRoster(c); saveCard(c); st[c.roster.status] = (st[c.roster.status] || 0) + 1; }
             renderList();
             const resumo = S.cards.length ? `<br><br>Cartões já carregados: ${st.exato || 0} conferem${st.corrigido ? `, ${st.corrigido} com CPF corrigido` : ''}${st['nome-difere'] ? `, ${st['nome-difere']} com nome diferente` : ''}${st['por-nome'] ? `, ${st['por-nome']} identificados pelo nome` : ''}${st.ambiguo ? `, ${st.ambiguo} ambíguos` : ''}${st['nao-encontrado'] ? `, ${st['nao-encontrado']} fora da lista` : ''}.` : '<br><br>Os próximos PDFs carregados serão conferidos com ela.';
