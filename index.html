@@ -3100,13 +3100,41 @@
         for (let i = 0; i < 256; i++) { wB += h[i]; if (!wB) continue; const wF = n - wB; if (!wF) break; sB += i * h[i]; const mB = sB / wB, mF = (sum - sB) / wF, b = wB * wF * (mB - mF) * (mB - mF); if (b > best) { best = b; t = i; } } return t;
       }
       const _ocrMed = a => { const b = a.slice().sort((x, y) => x - y); return b[b.length >> 1]; };
+      /* tom dominante da faixa do nome/CPF quando ela é escura (moda do histograma abaixo do branco do papel);
+         null se nenhum tom escuro domina (faixa clara ou sem fundo) */
+      function ocrStripTone(hist, n) {
+        // procura só abaixo do branco do papel (as margens brancas acima e abaixo da faixa ficariam com a moda)
+        let best = -1, bc = 0;
+        for (let v = 50; v <= 215; v++) { let c = 0; for (let d = -12; d <= 12; d++) c += hist[v + d] || 0; if (c > bc) { bc = c; best = v; } }
+        return bc >= 0.2 * n ? best : null;
+      }
+      function _ocrMedian3(g, w, h) {
+        const o = new Uint8Array(g.length), a = new Uint8Array(9);
+        for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+          let k = 0;
+          for (let dy = -1; dy <= 1; dy++) { const yy = Math.min(h - 1, Math.max(0, y + dy)); for (let dx = -1; dx <= 1; dx++) { const xx = Math.min(w - 1, Math.max(0, x + dx)); a[k++] = g[yy * w + xx]; } }
+          a.sort(); o[y * w + x] = a[4];
+        }
+        return o;
+      }
       function ocrPrepField(header, field, mode = 'gray') {
         const s = header.w / (HDR.x1 - HDR.x0), range = field === 'name' ? CARD.nameRange : CARD.cpfRange;
         const left = Math.max(0, Math.round((range[0] - HDR.x0) * s)), right = Math.min(header.w, Math.round((range[1] - HDR.x0) * s));
         const w = right - left, h = header.h, g = new Uint8Array(w * h), hist = new Uint32Array(256);
         for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) { const v = header.gray[y * header.w + left + x]; g[y * w + x] = v; hist[v]++; }
-        const pct = p => { let n = 0; for (let i = 0; i < 256; i++) { n += hist[i]; if (n >= w * h * p) return i; } return 255; };
-        const white = pct(.90), black = Math.min(pct(.01), white - 60);
+        let pct = p => { let n = 0; for (let i = 0; i < 256; i++) { n += hist[i]; if (n >= w * h * p) return i; } return 255; };
+        let white = pct(.90), black = Math.min(pct(.01), white - 60);
+        /* Faixa de fundo escuro (impressão carregada, retícula de pontos). O tom dominante da faixa fica
+           abaixo de 200 e os pontos da retícula descem perto do preto das letras. Nesse caso: alisa a retícula
+           com filtro de mediana e usa o próprio cinza da faixa como "branco", para que a letra se destaque dele.
+           Faixas claras (tom dominante 200 ou mais) seguem exatamente o caminho anterior. */
+        const bg = ocrStripTone(hist, w * h), darkBg = !!(bg && bg < 200);
+        if (darkBg) {
+          let m = _ocrMedian3(g, w, h); m = _ocrMedian3(m, w, h); g.set(m);
+          hist.fill(0); for (let i = 0; i < g.length; i++) hist[g[i]]++;
+          const tone = ocrStripTone(hist, w * h) || bg;
+          black = pct(.01); white = Math.max(black + 40, Math.round(tone - 0.12 * (tone - black)));
+        }
         for (let i = 0; i < g.length; i++) g[i] = Math.max(0, Math.min(255, (g[i] - black) * 255 / (white - black)));
         const t = Math.min(170, Math.max(90, _ocrOtsu(g))), mask = new Uint8Array(w * h);
         for (let i = 0; i < g.length; i++) mask[i] = g[i] < t ? 1 : 0;
@@ -3124,6 +3152,8 @@
         const bandLo = top - 0.3 * capH, bandHi = bot + 0.3 * capH, clip = new Set();
         let keep = comps.filter(c => {
           if (c.a < 2 * s * s) return false;
+          // fundo escuro: canto/borda da faixa colado na margem esquerda (mais alto que letra ou fino como barra)
+          if (darkBg && c.x0 <= 3 * s && (c.h > 1.3 * capH || c.w <= 0.25 * capH)) return false;
           if (field === 'name' && c.w >= 0.9 * capH && c.h <= 0.2 * capH) return false;
           // Só remove fiapos estreitos fora da linha de texto ou junto à margem da moldura.
           if (c.w <= 0.12 * capH && c.h >= 0.5 * capH && (c.x0 < 4 * s || c.x1 > w - 4 * s || c.y0 < top - .35 * capH || c.y1 > bot + .35 * capH)) return false;
@@ -3140,6 +3170,17 @@
         } else {
           const words = []; for (const c of keep) { const W = words[words.length - 1]; if (W && c.x0 - W.x1 <= 0.45 * capH) { W.x1 = Math.max(W.x1, c.x1); W.cs.push(c); } else words.push({ x0: c.x0, x1: c.x1, cs: [c] }); }
           for (const W of words) { if (!W.cs.some(c => c.h >= 0.7 * capH)) continue; if (use.length && W.x0 - use[use.length - 1].x1 > 3.5 * capH) break; use.push(W); }
+          /* fundo escuro: um traço fino no começo da linha, afastado da letra seguinte mais que o espaçamento
+             normal entre letras, é sobra da borda da faixa (o Tesseract leria "I"). Um "I" de verdade no
+             início do nome fica colado à letra seguinte e não é afetado. */
+          if (darkBg && use.length) {
+            const cs0 = use.flatMap(W => W.cs).sort((a, b) => a.x0 - b.x0), c0 = cs0[0], c1 = cs0[1];
+            if (c0 && c1 && c0.w <= 0.25 * capH && c0.h >= 0.6 * capH && c1.x0 - c0.x1 >= 0.25 * capH) {
+              for (const W of use) W.cs = W.cs.filter(c => c !== c0);
+              use = use.filter(W => W.cs.length);
+              for (const W of use) { W.x0 = Math.min(...W.cs.map(c => c.x0)); W.x1 = Math.max(...W.cs.map(c => c.x1)); }
+            }
+          }
         }
         const ids = new Set(); for (const W of use) for (const c of W.cs) ids.add(c.id);
         if (!ids.size) return null;
@@ -3148,10 +3189,18 @@
         const kill = new Uint8Array(w * h);
         for (let i = 0; i < w * h; i++) if (line[i] || (lab[i] && !ids.has(lab[i]))) kill[i] = 1;
         const cw = X1 - X0 + 1, chh = Y1 - Y0 + 1, px = new Uint8Array(cw * chh);
+        /* fundo escuro: o que não estiver a até 2 px de uma letra aceita vira branco (sobras da moldura e
+           da retícula, que o Tesseract leria como "I" ou ruído) */
+        let nearOwn = null;
+        if (darkBg) {
+          nearOwn = new Uint8Array(w * h);
+          for (let y = Y0; y <= Y1; y++) for (let x = X0; x <= X1; x++) if (ids.has(lab[y * w + x]))
+            for (let dy = -2; dy <= 2; dy++) for (let dx = -2; dx <= 2; dx++) { const yy = y + dy, xx = x + dx; if (yy >= 0 && yy < h && xx >= 0 && xx < w) nearOwn[yy * w + xx] = 1; }
+        }
         for (let y = Y0; y <= Y1; y++) for (let x = X0; x <= X1; x++) {
           const own = ids.has(lab[y * w + x]); let k = false;
           if (!own) for (let dy = -2; dy <= 2 && !k; dy++) for (let dx = -2; dx <= 2 && !k; dx++) { const yy = y + dy, xx = x + dx; if (yy < 0 || yy >= h || xx < 0 || xx >= w) continue; const j = yy * w + xx; if (kill[j] && !ids.has(lab[j])) k = true; }
-          let v = g[y * w + x]; if (k) v = 255; if ((y < bandLo || y > bandHi) && clip.has(lab[y * w + x])) v = 255;
+          let v = g[y * w + x]; if (k || (nearOwn && !nearOwn[y * w + x])) v = 255; if ((y < bandLo || y > bandHi) && clip.has(lab[y * w + x])) v = 255;
           px[(y - Y0) * cw + (x - X0)] = v;
         }
         if (mode === 'bin') { const tt = _ocrOtsu(px); for (let i = 0; i < px.length; i++) px[i] = px[i] < tt ? 0 : 255; }
