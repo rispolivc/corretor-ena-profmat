@@ -1658,6 +1658,60 @@
         return fitH(src, dst);
       }
 
+      /* ---------- modelo do scanner: rotação + escala (x e y) + translação ----------
+         Os cartões chegam de mesa digitalizadora: a folha pode estar levemente girada e deslocada, e
+         impressora e scanner podem escalar um pouco diferente na horizontal e na vertical (até ~9% nos
+         lotes reais). Não há cisalhamento nem perspectiva, então o modelo não os permite: com ele, uma
+         coluna de quadrados nunca encaixa uma linha fora da outra.
+         Matriz: [R(θ)·diag(ax, ay) | t], canônico -> imagem. */
+      function inv3(H) {
+        const a = H[0], b = H[1], c = H[2], d = H[3], e = H[4], f = H[5], g = H[6], h = H[7], i = H[8];
+        const A = e * i - f * h, B = -(d * i - f * g), C = d * h - e * g, det = a * A + b * B + c * C;
+        if (!det) return null;
+        return new Float64Array([A / det, -(b * i - c * h) / det, (b * f - c * e) / det, B / det, (a * i - c * g) / det, -(a * f - c * d) / det, C / det, -(a * h - b * g) / det, (a * e - b * d) / det]);
+      }
+      function fitRS(src, dst) {
+        const n = src.length; if (n < 3) return null;
+        let cx = 0, cy = 0, mu = 0, mv = 0;
+        for (let i = 0; i < n; i++) { cx += src[i][0]; cy += src[i][1]; mu += dst[i][0]; mv += dst[i][1]; }
+        cx /= n; cy /= n; mu /= n; mv /= n;
+        let sab = 0, sba = 0, sxx = 0, syy = 0;
+        for (let i = 0; i < n; i++) {
+          const x = src[i][0] - cx, y = src[i][1] - cy, u = dst[i][0] - mu, v = dst[i][1] - mv;
+          sab += x * u + y * v; sba += x * v - y * u; sxx += x * x; syy += y * y;
+        }
+        if (sxx + syy < 1e-6) return null;
+        const t0 = Math.atan2(sba, sab), sim = Math.hypot(sab, sba) / (sxx + syy);
+        // com pontos quase todos numa só coluna (ou linha), a escala daquele eixo não é determinada: usa a uniforme
+        const okx = sxx / n > 80 * 80, oky = syy / n > 80 * 80;
+        const evalT = t => {
+          const c = Math.cos(t), s = Math.sin(t); let px = 0, py = 0;
+          for (let i = 0; i < n; i++) { const u = dst[i][0] - mu, v = dst[i][1] - mv; px += (src[i][0] - cx) * (c * u + s * v); py += (src[i][1] - cy) * (-s * u + c * v); }
+          const ax = okx ? px / sxx : sim, ay = oky ? py / syy : sim; let res = 0;
+          for (let i = 0; i < n; i++) {
+            const u = dst[i][0] - mu, v = dst[i][1] - mv;
+            res += (ax * (src[i][0] - cx) - (c * u + s * v)) ** 2 + (ay * (src[i][1] - cy) - (-s * u + c * v)) ** 2;
+          }
+          return { res, ax, ay, c, s };
+        };
+        let lo = t0 - 0.08, hi = t0 + 0.08; const g = (Math.sqrt(5) - 1) / 2;
+        let x1 = hi - g * (hi - lo), x2 = lo + g * (hi - lo), f1 = evalT(x1).res, f2 = evalT(x2).res;
+        for (let k = 0; k < 40; k++) {
+          if (f1 < f2) { hi = x2; x2 = x1; f2 = f1; x1 = hi - g * (hi - lo); f1 = evalT(x1).res; }
+          else { lo = x1; x1 = x2; f1 = f2; x2 = lo + g * (hi - lo); f2 = evalT(x2).res; }
+        }
+        const r = evalT((lo + hi) / 2), c = r.c, sn = r.s;
+        if (!(r.ax > 0 && r.ay > 0)) return null;
+        const A0 = c * r.ax, A1 = -sn * r.ay, A3 = sn * r.ax, A4 = c * r.ay;
+        return new Float64Array([A0, A1, mu - A0 * cx - A1 * cy, A3, A4, mv - A3 * cx - A4 * cy, 0, 0, 1]);
+      }
+      /* o modelo é plausível para uma digitalização? (giro pequeno em torno de 0/90/180/270°, escalas parecidas) */
+      function plausibleRS(M) {
+        const ax = Math.hypot(M[0], M[3]), ay = Math.hypot(M[1], M[4]), ratio = ay / ax;
+        const t = Math.atan2(M[3], M[0]) * 180 / Math.PI, dev = Math.abs(((t % 90) + 135) % 90 - 45);
+        return dev <= 10 && ratio > 0.82 && ratio < 1.22;
+      }
+
       /* ---------- warp: espaço canônico -> imagem de origem (bilinear) ---------- */
       /* Tom de cinza para ler marcações. Anotações coloridas feitas por outro corretor (círculos azuis,
          vermelhos, verdes; cor pura e clara) viram papel; caneta azul ou preta, que é escura, continua tinta. */
@@ -1715,8 +1769,13 @@
         return { w, h, rgba, gray };
       }
 
-      /* ---------- localizar os 30 quadrados numerados ---------- */
-      function findMarkers(gray, w, h, s) {
+      /* ---------- localizar os 30 quadrados numerados ----------
+         gray: imagem de análise (já aproximadamente no espaço canônico, escala s).
+         Hpre: transformação canônico -> página original usada para gerar essa imagem. O modelo do scanner
+               (fitRS) é ajustado direto na página original, para que o resultado final seja rígido.
+         H0:   alinhamento já conhecido na imagem de análise (2ª passagem): sem votação, raios pequenos.
+         Retorna M (canônico -> página original) e R (canônico -> imagem de análise). */
+      function findMarkers(gray, w, h, s, H0, Hpre) {
         const n = w * h, W1 = w + 1;
         const ii = new Uint32Array(W1 * (h + 1));
         for (let y = 0; y < h; y++) {
@@ -1777,51 +1836,84 @@
           for (let a = -1; a <= 1; a++) for (let b = -1; b <= 1; b++) sum += votes.get((kx + a) * 1000 + ky + b) || 0;
           if (sum > bestV) { bestV = sum; bestKey = key; }
         }
-        if (bestKey < 0) return { inliers: 0, ncand: cands.length };
+        if (bestKey < 0 && !H0) return { inliers: 0, ncand: cands.length };
         const d0x = (Math.floor(bestKey / 1000) - 100) * bin, d0y = ((bestKey % 1000) - 100) * bin;
-        let H = null;
-        const pred = q => H ? apply3(H, tc[q][0], tc[q][1]) : [tc[q][0] + d0x, tc[q][1] + d0y];
-        const radii = [42, 22, 12, 8];
-        for (let it = 0; it < radii.length; it++) {
-          const srcP = [], dstP = [], used = new Set();
-          for (let q = 0; q < NQ; q++) {
-            const p = pred(q); let best = -1, bd = radii[it];
-            for (let i = 0; i < cands.length; i++) {
-              if (used.has(i)) continue;
-              const d = Math.hypot(cands[i].X - p[0], cands[i].Y - p[1]);
-              if (d < bd) { bd = d; best = i; }
-            }
-            if (best >= 0) { used.add(best); srcP.push(tc[q]); dstP.push([cands[best].X, cands[best].Y]); }
-          }
-          if (srcP.length < 6) return { inliers: srcP.length, ncand: cands.length };
-          const Hn = fitHR(srcP, dstP, it < 2 ? 6 : 2.5); if (!Hn) break; H = Hn;
-        }
-        if (!H) return { inliers: 0 };
-        /* Em fotos, a grade pode encaixar uma linha acima ou abaixo (28 dos 30 quadrados ainda coincidem).
-           Testa os dois deslocamentos de uma linha e fica com o encaixe que coincide mais. */
+        const I3 = new Float64Array([1, 0, 0, 0, 1, 0, 0, 0, 1]);
+        const Hp = Hpre || I3, Hpi = inv3(Hp) || I3;
+        const candS = cands.map(c => apply3(Hp, c.X, c.Y));          // candidatos na página original
+        // M: canônico -> página original; a previsão na imagem de análise é Hpi·M
+        const near = (P, x, y, rad, used) => {
+          let best = -1, bd = rad;
+          for (let i = 0; i < cands.length; i++) { if (used.has(i)) continue; const d = Math.hypot(cands[i].X - x, cands[i].Y - y); if (d < bd) { bd = d; best = i; } }
+          return best;
+        };
         const pitchY = TPL[1].y - TPL[0].y;
-        const assign = (sL, sR = sL) => {
-          const found = new Array(NQ).fill(null), used = new Set(), src = [], dst = []; let inl = 0;
+        const assign = (M, sL, sR = sL, rad = 8) => {
+          const P = mul3(Hpi, M), found = new Array(NQ).fill(null), used = new Set(), src = [], dst = []; let inl = 0;
           for (let q = 0; q < NQ; q++) {
-            const p = apply3(H, tc[q][0], tc[q][1] + (q < 15 ? sL : sR) * pitchY); let best = -1, bd = 8;
-            for (let i = 0; i < cands.length; i++) {
-              if (used.has(i)) continue;
-              const d = Math.hypot(cands[i].X - p[0], cands[i].Y - p[1]);
-              if (d < bd) { bd = d; best = i; }
-            }
-            if (best >= 0) { used.add(best); inl++; found[q] = { x: cands[best].X, y: cands[best].Y }; src.push(tc[q]); dst.push([cands[best].X, cands[best].Y]); }
+            const p = apply3(P, tc[q][0], tc[q][1] + (q < 15 ? sL : sR) * pitchY), b = near(P, p[0], p[1], rad, used);
+            if (b >= 0) { used.add(b); inl++; found[q] = { x: cands[b].X, y: cands[b].Y }; src.push(tc[q]); dst.push(candS[b]); }
           }
           return { inl, found, src, dst };
         };
-        let a0 = assign(0);
-        // cada coluna pode ter encaixado uma linha fora, de forma independente
-        for (let it = 0; it < 2; it++) {
-          let best = null;
-          for (const sL of [-1, 0, 1]) for (const sR of [-1, 0, 1]) { if (!sL && !sR) continue; const a = assign(sL, sR); if (a.inl > a0.inl && (!best || a.inl > best.inl)) best = a; }
-          if (!best || best.src.length < 6) break;
-          const Hn = fitHR(best.src, best.dst); if (!Hn) break; H = Hn; a0 = assign(0);
+        let M;
+        if (H0) M = mul3(Hp, H0);
+        else {
+          const T = new Float64Array([1, 0, d0x, 0, 1, d0y, 0, 0, 1]); M = mul3(Hp, T);
+          for (const rad of [42, 22]) { const a = assign(M, 0, 0, rad); if (a.src.length < 6) return { inliers: a.src.length, ncand: cands.length }; const Mn = fitRS(a.src, a.dst); if (!Mn) break; M = Mn; }
         }
-        return { inliers: a0.inl, R: H, found: a0.found, ncand: cands.length };
+        /* Hipóteses de encaixe. Quadrados rabiscados pelo candidato ou não detectados nas pontas das colunas
+           podem deixar a grade inteira encaixar uma linha acima ou abaixo com o mesmo número de coincidências.
+           Cada hipótese (colunas deslocadas de -2 a +2 linhas) é refinada e pontuada pelas coincidências; nos
+           empates, decidem as molduras dos balões: elas existem nas linhas 1 e 15 e não fora da grade. */
+        const refine = (Mb, sL, sR) => {
+          let a = assign(Mb, sL, sR, H0 ? 14 : 16); if (a.src.length < 6) return null;
+          let Mc = fitRS(a.src, a.dst); if (!Mc) return null;
+          for (const rad of [12, 8, 8]) { a = assign(Mc, 0, 0, rad); if (a.src.length < 6) return null; const Mn = fitRS(a.src, a.dst); if (!Mn) return null; Mc = Mn; }
+          a = assign(Mc, 0);
+          if (!plausibleRS(Mc)) return null;
+          return { M: Mc, a, inl: a.inl };
+        };
+        const hyps = [];
+        const shifts = H0 ? [[0, 0], [-1, -1], [1, 1]] : [[0, 0], [-1, -1], [1, 1], [-2, -2], [2, 2], [-1, 0], [1, 0], [0, -1], [0, 1]];
+        for (const [sL, sR] of shifts) { const e = refine(M, sL, sR); if (e) hyps.push(e); }
+        if (!hyps.length) return { inliers: 0, ncand: cands.length };
+        // hipóteses iguais (mesmo encaixe final) contam uma vez
+        const uniq = [];
+        for (const e of hyps) {
+          const p = apply3(e.M, tc[0][0], tc[0][1]);
+          if (!uniq.some(u => { const r = apply3(u.M, tc[0][0], tc[0][1]); return Math.hypot(p[0] - r[0], p[1] - r[1]) < 4 * Math.hypot(Hp[0], Hp[3]); })) uniq.push(e);
+        }
+        uniq.sort((a, b) => b.inl - a.inl);
+        let pick = uniq[0];
+        const ties = uniq.filter(e => e.inl >= uniq[0].inl - 1);
+        if (ties.length > 1) {
+          for (const e of ties) e.fr = frameScore(gray, w, h, s, mul3(Hpi, e.M));
+          const byFr = ties.slice().sort((a, b) => b.fr - a.fr);
+          if (byFr[0] !== pick && byFr[0].fr > (pick.fr || 0) + 0.04) pick = byFr[0];
+        }
+        return { inliers: pick.a.inl, R: mul3(Hpi, pick.M), M: pick.M, found: pick.a.found, ncand: cands.length };
+      }
+      /* Evidência de molduras de balão: positiva nas linhas 1 e 15 de cada coluna, negativa nas linhas
+         fictícias logo acima (0) e logo abaixo (16), onde o cartão não tem balões.
+         P: canônico -> imagem de análise (coordenadas canônicas; a imagem tem escala s). */
+      function frameScore(gray, w, h, s, P) {
+        const px = (X, Y) => { const p = apply3(P, X, Y), x = Math.round(p[0] * s), y = Math.round(p[1] * s); return x >= 0 && y >= 0 && x < w && y < h ? 255 - gray[y * w + x] : 0; };
+        const rowFrame = (col, i) => {
+          const t = TPL[col * 15], y0 = t.y + i * (TPL[col * 15 + 1].y - t.y); let sum = 0, n = 0;
+          for (let k = 0; k < 5; k++) {
+            const x0 = t.x + BOX_DX + BOX_STEP * k;
+            for (let x = x0 + 4; x <= x0 + BOX_W - 4; x += 2) {
+              if (CARD.glyphs && x - x0 >= 10 && x - x0 <= 36) continue;
+              let top = 0, bot = 0; for (let d = -2; d <= 2; d++) { top = Math.max(top, px(x, y0 + d)); bot = Math.max(bot, px(x, y0 + BOX_H + d)); }
+              sum += (top + bot) / 2 - (px(x, y0 + 7) + px(x, y0 + BOX_H - 7)) / 2; n++;
+            }
+          }
+          return n ? sum / n / 255 : 0;
+        };
+        let sc = 0;
+        for (const col of [0, 1]) sc += rowFrame(col, 0) + rowFrame(col, 14) - rowFrame(col, -1) - rowFrame(col, 15);
+        return sc / 4;
       }
 
       /* ---------- localizar a folha (quadrilátero claro) numa foto ---------- */
@@ -1873,7 +1965,7 @@
         for (let r = 0; r < 4; r++) {
           if ((r % 2 === 0 && !upright) || (r % 2 === 1 && !sideways)) continue;
           const dst = [0, 1, 2, 3].map(i => P[(i + r) % 4]);
-          const H = fitH(canon, dst); if (H) out.push({ name: 'quad' + r, H, rot: r });
+          const H = fitRS(canon, dst); if (H) out.push({ name: 'quad' + r, H, rot: r });
         }
         return out;
       }
@@ -1902,14 +1994,19 @@
         const diag = []; let weak = null;
         for (const c of cands) {
           const w5 = warpRGBA(src, sw, sh, c.H, 0.5);
-          const f0 = findMarkers(w5.gray, w5.w, w5.h, 0.5);
+          const f0 = findMarkers(w5.gray, w5.w, w5.h, 0.5, null, c.H);
           diag.push(c.name + ':' + f0.inliers);
-          if (!(f0.inliers >= 22 && f0.R)) continue;
-          let H = mul3(c.H, f0.R), cur = warpRGBA(src, sw, sh, H, 1), f = findMarkers(cur.gray, cur.w, cur.h, 1);
-          if (f.R && f.inliers >= f0.inliers - 4) {
-            const shift = Math.hypot(f.R[2], f.R[5]);
-            H = mul3(H, f.R);
-            if (shift > 1.0) { cur = warpRGBA(src, sw, sh, H, 1); f = findMarkers(cur.gray, cur.w, cur.h, 1); }
+          if (!(f0.inliers >= 22 && f0.M)) continue;
+          /* 2ª passagem em resolução cheia: a imagem já está alinhada, então o ajuste parte dela (só corrige
+             poucos pixels) e é recusado se mover algum quadrado mais que meia linha. */
+          const I3 = new Float64Array([1, 0, 0, 0, 1, 0, 0, 0, 1]);
+          let H = f0.M, cur = warpRGBA(src, sw, sh, H, 1), f = findMarkers(cur.gray, cur.w, cur.h, 1, I3, H);
+          if (f.M && f.inliers >= f0.inliers - 4) {
+            let mv = 0; for (const t of TPL) { const x = t.x + t.w / 2, y = t.y + t.h / 2, p = apply3(f.R, x, y); mv = Math.max(mv, Math.hypot(p[0] - x, p[1] - y)); }
+            if (mv <= 15) {
+              H = f.M;
+              if (mv > 1.0) { cur = warpRGBA(src, sw, sh, H, 1); f = findMarkers(cur.gray, cur.w, cur.h, 1, I3, H); }
+            } else f = findMarkers(cur.gray, cur.w, cur.h, 1, I3, H);
           }
           const res = markerResidual(f.found);
           const r = { ok: true, H, header: warpHeader(src, sw, sh, H, 2), ocr: (typeof ocrFromSource === 'function' ? ocrFromSource(src, sw, sh, H) : null), inliers: f.inliers, found: f.found || new Array(NQ).fill(null), rgba: cur.rgba, gray: cur.gray, via: c.name, diag, resid: res };
@@ -1942,13 +2039,18 @@
               const s = edge / ne - ring / nr; sum += s; cnt++;
               if (!best || s > best.s) best = { s, dx, dy };
             }
-            fits.push({ k, dx: best.dx, dy: best.dy, w: Math.max(0, best.s - 0.12) * Math.max(0, best.s - sum / cnt) });
+            // encaixe na borda da busca não é encaixe: a moldura de verdade está fora do alcance ou não foi vista
+            const edgeHit = Math.abs(best.dx) >= 7 || Math.abs(best.dy) >= 5;
+            fits.push({ k, dx: best.dx, dy: best.dy, w: edgeHit ? 0 : Math.max(0, best.s - 0.12) * Math.max(0, best.s - sum / cnt) });
           }
           const good = fits.filter(f => f.w > 0);
           let row;
           if (good.length >= 2) {
             const sw = good.reduce((a, f) => a + f.w, 0), mk = good.reduce((a, f) => a + f.w * f.k, 0) / sw, mx = good.reduce((a, f) => a + f.w * f.dx, 0) / sw;
-            const vk = good.reduce((a, f) => a + f.w * (f.k - mk) ** 2, 0), b = vk > 1e-6 ? good.reduce((a, f) => a + f.w * (f.k - mk) * (f.dx - mx), 0) / vk : 0;
+            const vk = good.reduce((a, f) => a + f.w * (f.k - mk) ** 2, 0), b0 = vk > 1e-6 ? good.reduce((a, f) => a + f.w * (f.k - mk) * (f.dx - mx), 0) / vk : 0;
+            /* o espaçamento entre balões é fixo na impressão: um erro de escala dá menos de 1 px por balão.
+               Inclinações maiores vêm de molduras pontilhadas/apagadas mal encaixadas e não são aceitas. */
+            const b = Math.max(-0.8, Math.min(0.8, b0));
             const my = good.reduce((a, f) => a + f.w * f.dy, 0) / sw;
             row = fits.map(f => [Math.max(-7, Math.min(7, Math.round(mx + b * (f.k - mk)))), Math.max(-5, Math.min(5, Math.round(my)))]);
           } else if (good.length === 1) row = fits.map(() => [good[0].dx, good[0].dy]);
@@ -2014,7 +2116,7 @@
           let on = 0; const pts = [];
           for (let y = 0; y < ph; y++) for (let x = 0; x < pw; x++) if (core[y * pw + x]) {
             on++; pts.push([x, y]);
-            for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) { const yy = y + dy, xx = x + dx; if (yy >= 0 && yy < ph && xx >= 0 && xx < pw) dil[yy * pw + xx] = 1; }
+            for (let dy = -2; dy <= 2; dy++) for (let dx = -2; dx <= 2; dx++) { if (dx * dx + dy * dy > 5) continue; const yy = y + dy, xx = x + dx; if (yy >= 0 && yy < ph && xx >= 0 && xx < pw) dil[yy * pw + xx] = 1; }
           }
           // letra plausível: ocupa entre ~3% e 35% do miolo
           const inner = (pw - 2 * PAD - 8) * (ph - 2 * PAD - 4), frac = on / inner;
@@ -2032,7 +2134,7 @@
             const g = tpl[k][q < 15 ? 0 : 1]; if (!g) return null;
             const bx = Math.round(r.x) - PAD, by = Math.round(r.y) - PAD;
             let best = -1, sx = 0, sy = 0;
-            for (let dy = -3; dy <= 3; dy++) for (let dx = -3; dx <= 3; dx++) {
+            for (let dy = -3; dy <= 3; dy++) for (let dx = -5; dx <= 5; dx++) {
               let s = 0; for (const [x, y] of g.pts) if (gray[(by + y + dy) * CW + bx + x + dx] < T) s++;
               s -= 0.01 * (Math.abs(dx) + Math.abs(dy));
               if (s > best) { best = s; sx = dx; sy = dy; }
@@ -2320,7 +2422,7 @@
               ln.hits.forEach(h => { const p = cs[h.m]; const slot = sg === 1 ? h.k - kmin : kmax - h.k; if (slot >= 0 && slot < 15) { src2.push(tc[base + slot]); dst2.push([p.x / k, p.y / k]); } });
             }
             if (src2.length < 14) continue;
-            const H = fitHR(src2, dst2); if (H) out.push({ name: 'linhas' + (sg === 1 ? '+' : '-'), H, score: A.n + B.n });
+            const H = fitRS(src2, dst2); if (H) out.push({ name: 'linhas' + (sg === 1 ? '+' : '-'), H, score: A.n + B.n });
           }
         }
         out.sort((p, q) => q.score - p.score);
@@ -2342,9 +2444,9 @@
       function lineBestCandidate(src, sw, sh) {
         const cs = markerLineCandidates(src, sw, sh); let best = null;
         for (const c of cs.slice(0, 6)) {
-          const w5 = warpRGBA(src, sw, sh, c.H, 0.5), f = findMarkers(w5.gray, w5.w, w5.h, 0.5);
+          const w5 = warpRGBA(src, sw, sh, c.H, 0.5), f = findMarkers(w5.gray, w5.w, w5.h, 0.5, null, c.H);
           if (f.inliers < 22 || !f.R) continue;
-          const H2 = mul3(c.H, f.R), w1 = warpRGBA(src, sw, sh, H2, 1), ss = structScore(w1.gray);
+          const H2 = f.M, w1 = warpRGBA(src, sw, sh, H2, 1), ss = structScore(w1.gray);
           if (!best || ss > best.ss) best = { name: 'linhas', H: H2, ss, rot: 0 };
         }
         return best;
@@ -3173,7 +3275,7 @@
           canonical.getContext('2d').drawImage(cv, 0, 0, CW, CH);
           const cd = canonical.getContext('2d').getImageData(0, 0, CW, CH).data, gray = new Uint8Array(CW * CH);
           for (let i = 0; i < gray.length; i++) gray[i] = inkGray(cd[4 * i], cd[4 * i + 1], cd[4 * i + 2]);
-          const found = findMarkers(gray, CW, CH, 1).found;
+          const found = findMarkers(gray, CW, CH, 1, new Float64Array([1, 0, 0, 0, 1, 0, 0, 0, 1])).found;
           const rf = readFills(gray, found), cl = classify(rf.fills, thr(), rf.evidence), fl = readFlags(gray);
           if (S.openId !== c.id) return;
           c.fills = rf.fills; c.offs = rf.offs; c.evidence = rf.evidence; c.flagRead = fl; c.detectionVersion = 3;
