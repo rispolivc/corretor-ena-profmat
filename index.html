@@ -3436,6 +3436,83 @@
           ROSTER.byCpf.set(e.cpf, ROSTER.byCpf.has(e.cpf) ? null : e);
         }
       }
+      /* ---- dados complementares da lista de inscritos (desempate do edital, item 7.1.1) ----
+         Data de nascimento, rede (pública/privada) e quadro permanente. As colunas são achadas pelo
+         cabeçalho e, sem cabeçalho reconhecível, pelo conteúdo. Tudo é opcional: o que faltar fica em branco. */
+      const _hdr = v => String(v == null ? '' : v).normalize('NFD').replace(/[\u0300-\u036f]/g, '').toUpperCase().replace(/[_\s]+/g, ' ').trim();
+      function parseBirth(v) {
+        if (v == null || v === '') return '';
+        let y, m, d;
+        if (v instanceof Date && !isNaN(v)) { y = v.getFullYear(); m = v.getMonth() + 1; d = v.getDate(); }
+        else if (typeof v === 'number' && v > 1000 && v < 80000 && window.XLSX && XLSX.SSF) { const p = XLSX.SSF.parse_date_code(v); if (!p) return ''; y = p.y; m = p.m; d = p.d; }
+        else {
+          const t = String(v).trim(); let k;
+          if ((k = t.match(/^(\d{4})[-\/.](\d{1,2})[-\/.](\d{1,2})/))) { y = +k[1]; m = +k[2]; d = +k[3]; }
+          else if ((k = t.match(/^(\d{1,2})[-\/.](\d{1,2})[-\/.](\d{2}|\d{4})\b/))) { d = +k[1]; m = +k[2]; y = +k[3]; if (y < 100) y += y > 30 ? 1900 : 2000; }
+          else if ((k = t.match(/^(\d{2})(\d{2})(\d{4})$/))) { d = +k[1]; m = +k[2]; y = +k[3]; }
+          else return '';
+        }
+        if (!(y >= 1900 && y <= 2015 && m >= 1 && m <= 12 && d >= 1 && d <= 31)) return '';
+        return `${y}-${String(m).padStart(2, '0')}-${String(d).padStart(2, '0')}`;
+      }
+      function parseRede(v) {
+        const t = _hdr(v); if (!t) return '';
+        if (/PUBLIC|MUNICIPAL|ESTADUAL|FEDERAL|DISTRITAL/.test(t)) return 'Pública';   // "pública e privada" conta como pública
+        if (/PRIVAD|PARTICULAR/.test(t)) return 'Privada';
+        return '';
+      }
+      function parseSimNao(v) {
+        const t = _hdr(v); if (!t || /INFORMAD|INFORMACAO/.test(t)) return '';   // "Não informado" não é resposta
+        if (/^(N|NAO|NO|FALSE|FALSO|0)$/.test(t) || /\bNAO\b|TEMPORARI|CONTRAT|SUBSTITUT|DESIGNAD|\bCLT\b|PRECARI|SELETIV/.test(t)) return 'Não';
+        if (/^(S|SIM|Y|YES|TRUE|VERDADEIRO|X|1)$/.test(t) || /EFETIV|PERMANENTE|CONCURSAD|ESTATUTARI|NOMEAD/.test(t)) return 'Sim';
+        return '';
+      }
+      function parsePermFromText(v) {   // coluna única do tipo "Rede pública - efetivo"
+        const t = _hdr(v); if (!t) return '';
+        if (/\bNAO\b.*(EFETIV|PERMANENTE)|TEMPORARI|CONTRAT|SUBSTITUT|DESIGNAD|PRECARI/.test(t)) return 'Não';
+        if (/EFETIV|PERMANENTE|CONCURSAD|ESTATUTARI/.test(t)) return 'Sim';
+        return '';
+      }
+      function rosterExtraCols(rows, hr, cc, nc) {
+        const out = { nasc: -1, rede: -1, redePub: -1, redePriv: -1, perm: -1, permPub: false };
+        const ncol = Math.max(0, ...rows.map(r => r.length)), skip = k => k === cc || k === nc;
+        if (hr >= 0) {
+          const h = (rows[hr] || []).map(_hdr);
+          for (let k = 0; k < h.length; k++) {
+            if (skip(k) || !h[k]) continue;
+            if (out.perm < 0 && /PERMANENTE|EFETIV|QUADRO|CONCURSAD|VINCULO|ESTATUTARI/.test(h[k])) out.perm = k;
+            else if (out.nasc < 0 && /NASC|DATA DE NASC|DT NASC|NASCIMENTO/.test(h[k])) out.nasc = k;
+            else if (/\bREDE\b|PUBLICA|PRIVADA|DEPENDENCIA|ESFERA|TIPO DE ESCOLA/.test(h[k])) {
+              // pergunta só sobre a pública ("professor_rede_publica", "Atua na rede pública?"), só sobre a privada,
+              // ou coluna única com o nome da rede
+              const pub = /PUBLIC/.test(h[k]), priv = /PRIVAD/.test(h[k]);
+              if (pub && !priv) { if (out.redePub < 0) out.redePub = k; }
+              else if (priv && !pub) { if (out.redePriv < 0) out.redePriv = k; }
+              else if (out.rede < 0) out.rede = k;
+            }
+          }
+          // "Professor efetivo da rede pública?": um Sim também diz que a rede é pública
+          if (out.perm >= 0) out.permPub = /PUBLIC/.test(h[out.perm]);
+        }
+        // sem cabeçalho reconhecível: procura pelo conteúdo
+        const body = rows.slice(hr + 1), frac = (k, f) => { let n = 0, ok = 0; for (const r of body) { const v = r[k]; if (v === '' || v == null) continue; n++; if (f(v)) ok++; } return n >= 3 ? ok / n : 0; };
+        for (let k = 0; k < ncol; k++) {
+          if (skip(k) || k === out.nasc || k === out.rede || k === out.redePub || k === out.redePriv || k === out.perm) continue;
+          // pelo conteúdo, só datas escritas como texto: números soltos (inscrição, nota) não viram data
+          if (out.nasc < 0 && frac(k, v => typeof v === 'string' && !!parseBirth(v)) >= 0.8) out.nasc = k;
+          else if (out.rede < 0 && frac(k, v => !!parseRede(v)) >= 0.8) out.rede = k;
+        }
+        return out;
+      }
+      /* idade completa (anos) na data da prova */
+      function ageAt(iso, ref) {
+        if (!iso || !ref) return null;
+        const [y, m, d] = iso.split('-').map(Number), [Y, M, D] = ref.split('-').map(Number);
+        return Y - y - ((M < m || (M === m && D < d)) ? 1 : 0);
+      }
+      const fmtBirth = iso => iso ? iso.split('-').reverse().join('/') : '';
+      /* CPF mascarado conforme o edital (item 6.5): ***.XXX.XXX-** */
+      const maskCpf = c => { const d = cpfDigits(c); return d.length === 11 ? `***.${d.slice(3, 6)}.${d.slice(6, 9)}-**` : ''; };
       async function readRoster(file) {
         await loadLib('xlsx');
         const bytes = await file.arrayBuffer();
@@ -3468,13 +3545,25 @@
             cc = bc; nc = bn; hr = -1;
           }
           if (cc < 0 || nc < 0) continue;
+          const ext = rosterExtraCols(rows, hr, cc, nc);
           const list = [], bad = [];
           for (let i = hr + 1; i < rows.length; i++) {
             const cpf = cpfOf(rows[i][cc]), nome = String(rows[i][nc] || '').replace(/\s+/g, ' ').trim();
             if (!cpf && !nome) continue;
-            if (cpf.length === 11 && cpfValido(cpf) && nome) list.push({ nome, cpf, row: i }); else bad.push(i + 1);
+            if (cpf.length === 11 && cpfValido(cpf) && nome) {
+              const e = { nome, cpf, row: i };
+              if (ext.nasc >= 0) e.nasc = parseBirth(rows[i][ext.nasc]);
+              e.rede = ext.rede >= 0 ? parseRede(rows[i][ext.rede]) : '';
+              const pub = ext.redePub >= 0 ? parseSimNao(rows[i][ext.redePub]) : '', priv = ext.redePriv >= 0 ? parseSimNao(rows[i][ext.redePriv]) : '';
+              if (!e.rede) e.rede = pub === 'Sim' ? 'Pública' : priv === 'Sim' ? 'Privada'
+                : (pub === 'Não' && ext.redePriv < 0) ? 'Privada' : (priv === 'Não' && ext.redePub < 0) ? 'Pública' : '';
+              if (ext.perm >= 0) e.perm = parseSimNao(rows[i][ext.perm]);
+              else if (ext.rede >= 0) e.perm = parsePermFromText(rows[i][ext.rede]);
+              if (!e.rede && ext.permPub && e.perm === 'Sim') e.rede = 'Pública';
+              list.push(e);
+            } else bad.push(i + 1);
           }
-          if (!best || list.length > best.list.length) best = { list, bad, sheet: sn, headerRow: Math.max(0, hr), cpfCol: cc, nameCol: nc };
+          if (!best || list.length > best.list.length) best = { list, bad, sheet: sn, headerRow: Math.max(0, hr), cpfCol: cc, nameCol: nc, extraCols: ext };
         }
         if (!best || !best.list.length) throw new Error('Não encontrei colunas de nome e CPF válidos neste arquivo.');
         return { file: file.name, bytes, ...best };
@@ -3904,7 +3993,7 @@
       // Acrescenta células diretamente ao pacote OOXML, sem reescrever as células
       // e os estilos existentes. Assim os títulos, os filtros, a formatação, as
       // demais abas e metadados continuam iguais aos da planilha fornecida.
-      function addGradeColumnToXlsx(bytes, sheetName, headerRow, noteCol, selected) {
+      function addGradeColumnToXlsx(bytes, sheetName, headerRow, noteCol, selected, order) {
         const zip = XLSX.CFB.read(new Uint8Array(bytes), { type: 'array' });
         const getPart = path => {
           const entry = XLSX.CFB.find(zip, path);
@@ -3917,8 +4006,9 @@
           return m ? m[1] : '';
         };
         const unxml = value => value.replace(/&quot;/g, '"').replace(/&apos;|&#39;|&#039;/g, "'").replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&');
-        const bookXml = decode('/xl/workbook.xml');
-        const sheetTag = [...bookXml.matchAll(/<sheet\b[^>]*>/g)].map(m => m[0]).find(tag => unxml(attr(tag, 'name')) === sheetName);
+        let bookXml = decode('/xl/workbook.xml');
+        const sheetTags = [...bookXml.matchAll(/<sheet\b[^>]*>/g)].map(m => m[0]);
+        const sheetTag = sheetTags.find(tag => unxml(attr(tag, 'name')) === sheetName);
         if (!sheetTag) throw new Error('A aba da lista não aparece no arquivo original.');
         const relId = attr(sheetTag, 'r:id');
         const relXml = decode('/xl/_rels/workbook.xml.rels');
@@ -3927,48 +4017,74 @@
         const target = attr(relTag, 'Target');
         if (!target || target.includes('..')) throw new Error('Endereço interno da aba inválido.');
         const worksheetPath = target.startsWith('/') ? target : '/xl/' + target.replace(/^xl\//, '');
-        const entry = getPart(worksheetPath);
         let xml = decode(worksheetPath);
-        const colLabel = XLSX.utils.encode_col(noteCol);
-        const cellOf = row => colLabel + row;
+        const noteLab = XLSX.utils.encode_col(noteCol), ordLab = XLSX.utils.encode_col(noteCol + 1);
         const notes = new Map([...selected.values()].map(e => [e.row + 1, e.note]));
-        let headerDone = false;
-        xml = xml.replace(/<row\b([^>]*?)(?<!\/)>([\s\S]*?)<\/row>/g, (whole, attributes, inside) => {
-          const rm = attributes.match(/\br="(\d+)"/);
-          if (!rm) return whole;
-          const rowNumber = Number(rm[1]);
-          let next = '';
-          if (rowNumber === headerRow + 1) {
-            if (inside.includes(`r="${cellOf(rowNumber)}"`)) throw new Error('A coluna de notas já possui conteúdo.');
-            const style = inside.match(/<c\b[^>]*\bs="(\d+)"/);
-            next = `<c r="${cellOf(rowNumber)}"${style ? ' s="' + style[1] + '"' : ''} t="inlineStr"><is><t>Nota</t></is></c>`;
-            headerDone = true;
-          } else if (notes.has(rowNumber)) {
-            if (inside.includes(`r="${cellOf(rowNumber)}"`)) throw new Error('A coluna de notas já possui conteúdo.');
-            const note = notes.get(rowNumber);
-            if (!Number.isFinite(note)) throw new Error('Foi encontrada uma nota inválida.');
-            next = `<c r="${cellOf(rowNumber)}" t="n"><v>${note}</v></c>`;
-            notes.delete(rowNumber);
+        const ordem = new Map([...(order ? order.ordem : new Map())].map(([r, o]) => [r + 1, o]));
+        const hdrNum = headerRow + 1;
+        const sd = xml.match(/<sheetData\b[^>]*>([\s\S]*?)<\/sheetData>|<sheetData\b[^>]*\/>/);
+        if (!sd) throw new Error('Aba sem dados.');
+        const rowsXml = [...(sd[1] || '').matchAll(/<row\b[^>]*?\/>|<row\b[^>]*>[\s\S]*?<\/row>/g)].map(m => m[0]);
+        const parsed = rowsXml.map(x => {
+          const open = x.match(/^<row\b[^>]*?\/?>/)[0], selfClose = /\/>$/.test(open);
+          return { open: selfClose ? open.replace(/\s*\/>$/, '>') : open, inside: selfClose ? '' : x.slice(open.length, -'</row>'.length), num: Number((open.match(/\br="(\d+)"/) || [, 0])[1]) };
+        });
+        if (parsed.some(p => !p.num)) throw new Error('Linha sem numeração na planilha original.');
+        let headerStyle = '';
+        for (const p of parsed) {
+          const add = [];
+          if (p.num === hdrNum) {
+            if (p.inside.includes(`r="${noteLab}${p.num}"`) || p.inside.includes(`r="${ordLab}${p.num}"`)) throw new Error('As colunas de nota e ordem já possuem conteúdo.');
+            const st = p.inside.match(/<c\b[^>]*\bs="(\d+)"/); headerStyle = st ? ' s="' + st[1] + '"' : '';
+            add.push(`<c r="${noteLab}${p.num}"${headerStyle} t="inlineStr"><is><t>Nota</t></is></c>`, `<c r="${ordLab}${p.num}"${headerStyle} t="inlineStr"><is><t>Ordem</t></is></c>`);
+          } else {
+            if (notes.has(p.num)) {
+              const note = notes.get(p.num); if (!Number.isFinite(note)) throw new Error('Foi encontrada uma nota inválida.');
+              add.push(`<c r="${noteLab}${p.num}" t="n"><v>${note}</v></c>`); notes.delete(p.num);
+            }
+            if (ordem.has(p.num)) add.push(`<c r="${ordLab}${p.num}" t="n"><v>${ordem.get(p.num)}</v></c>`);
           }
-          return next ? `<row${attributes}>${inside}${next}</row>` : whole;
-        });
-        if (!headerDone) throw new Error('A linha do cabeçalho não existe no arquivo.');
+          if (add.length && (p.inside.includes(`r="${noteLab}${p.num}"`) || p.inside.includes(`r="${ordLab}${p.num}"`))) throw new Error('As colunas de nota e ordem já possuem conteúdo.');
+          p.inside += add.join('');
+          p.open = p.open.replace(/\bspans="(\d+):(\d+)"/, (m, a1, b1) => `spans="${a1}:${Math.max(+b1, noteCol + 2)}"`);
+        }
+        if (!parsed.some(p => p.num === hdrNum)) throw new Error('A linha do cabeçalho não existe no arquivo.');
         if (notes.size) throw new Error('Uma ou mais linhas dos candidatos não foram encontradas.');
-        xml = xml.replace(/(<dimension\b[^>]*\bref=")[^"]+("?)/, (all, a, b) => {
-          const m = all.match(/ref="([^"]+)"/);
-          if (!m) return all;
-          const range = XLSX.utils.decode_range(m[1]);
-          range.e.c = Math.max(range.e.c, noteCol);
-          return all.replace(m[1], XLSX.utils.encode_range(range));
-        });
-        if (/<\/cols>/.test(xml)) xml = xml.replace(/<\/cols>/, `<col min="${noteCol + 1}" max="${noteCol + 1}" width="12" customWidth="1"/></cols>`);
+        // reordena as linhas de candidatos (só valores: sem fórmulas, que dependeriam da posição)
+        let outRows = parsed;
+        const data = parsed.filter(p => p.num > hdrNum);
+        if (order && order.lead.length && !data.some(p => /<f[\s>]/.test(p.inside))) {
+          const byNum = new Map(data.map(p => [p.num, p])), seen = new Set(), seq = [];
+          for (const r0 of order.lead) { const p = byNum.get(r0 + 1); if (p && !seen.has(p)) { seq.push(p); seen.add(p); } }
+          for (const p of data) if (!seen.has(p)) seq.push(p);
+          const slots = data.map(p => p.num);   // mesmas posições, outra ordem
+          seq.forEach((p, i) => {
+            const n = slots[i];
+            p.open = p.open.replace(/\br="\d+"/, `r="${n}"`);
+            p.inside = p.inside.replace(/(<c\b[^>]*?\br=")([A-Z]+)\d+(")/g, (m, a1, col, b1) => a1 + col + n + b1);
+            p.num = n;
+          });
+          outRows = parsed.filter(p => p.num <= hdrNum).concat(seq);
+        }
+        const body = outRows.map(p => p.open + p.inside + '</row>').join('');
+        xml = xml.replace(sd[0], (sd[0].match(/^<sheetData\b[^>]*?(?=\/?>)/)[0]) + '>' + body + '</sheetData>');
+        const widen = ref => { const rg = XLSX.utils.decode_range(ref.replace(/\$/g, '')); rg.e.c = Math.max(rg.e.c, noteCol + 1); return XLSX.utils.encode_range(rg); };
+        xml = xml.replace(/(<dimension\b[^>]*\bref=")([^"]+)(")/, (m, a1, ref, b1) => a1 + widen(ref) + b1);
+        xml = xml.replace(/(<autoFilter\b[^>]*\bref=")([^"]+)(")/, (m, a1, ref, b1) => a1 + widen(ref) + b1);
+        if (/<\/cols>/.test(xml)) xml = xml.replace(/<\/cols>/, `<col min="${noteCol + 1}" max="${noteCol + 1}" width="10" customWidth="1"/><col min="${noteCol + 2}" max="${noteCol + 2}" width="10" customWidth="1"/></cols>`);
         XLSX.CFB.utils.cfb_add(zip, worksheetPath, new TextEncoder().encode(xml));
+        // intervalo do filtro guardado no livro (_FilterDatabase) acompanha as novas colunas
+        const idx = sheetTags.indexOf(sheetTag);
+        bookXml = bookXml.replace(/(<definedName\b[^>]*name="_xlnm\._FilterDatabase"[^>]*localSheetId="(\d+)"[^>]*>)([^<]*)(<\/definedName>)/g, (m, open, sid, ref, close) => {
+          if (+sid !== idx) return m;
+          return open + ref.replace(/\$([A-Z]+)\$(\d+)(?=[^:]*$)/, (mm, col, row) => '$' + XLSX.utils.encode_col(Math.max(XLSX.utils.decode_col(col), noteCol + 1)) + '$' + row) + close;
+        });
+        XLSX.CFB.utils.cfb_add(zip, '/xl/workbook.xml', new TextEncoder().encode(bookXml));
         return XLSX.CFB.write(zip, { type: 'array', fileType: 'zip', compression: true });
       }
-
-      /* Os mesmos dados da exportação tradicional, agora também disponíveis
-         dentro da planilha dos inscritos em uma aba independente. */
+      const DATA_PROVA = '2026-10-10';   // ENA 2027 (edital nº 23/2026): só define quem tem 60 anos ou mais (item 7.1.1.1)
       function buildResultRows() {
+        if (ROSTER.list) return buildRosterResultRows();
         const head = ['Nome', 'CPF', 'Acertos', 'Nota', 'Situação', 'Revisão', 'Alertas', 'Lista de inscritos']
           .concat(Array.from({ length: NQ }, (_, i) => 'Q' + (i + 1)));
         const rows = [head];
@@ -3985,11 +4101,79 @@
         }
         return rows;
       }
-
-      /* Adiciona apenas os novos componentes OOXML ao arquivo já modificado.
-         Evita regravar as abas existentes e perder filtros, estilos ou mesclagens.
-         As strings usam inlineStr; números permanecem numéricos para as estatísticas. */
-      function addResultsSheetToXlsx(bytes, rows) {
+      /* Com a lista de inscritos: aba Resultados ordenada pela nota e pelos critérios de desempate do edital
+         (item 7.1.1), com CPF mascarado (item 6.5), data de nascimento, rede e quadro permanente.
+         Desempate, sucessivamente:
+           1) idade mais elevada entre candidatos com 60 anos ou mais na data da prova (Estatuto do Idoso);
+           2) professor do quadro permanente da rede pública;
+           3) idade mais elevada.
+         Ausentes e eliminados vão ao final, sem ordem de classificação. */
+      const RESULT_COL_WIDTHS = [7, 38, 16, 16, 12, 9, 11, 9, 11, 12, 34, 42, 26];
+      function rosterEntryOf(c) {
+        const d = cpfDigits(c.cpf);
+        return (d && ROSTER.byCpf.get(d)) || (c.roster && c.roster.cpf && ROSTER.byCpf.get(c.roster.cpf)) || null;
+      }
+      /* Classificação pela nota e pelos critérios de desempate do edital (item 7.1.1), sucessivamente:
+           1) idade mais elevada entre os candidatos com 60 anos ou mais na data da prova (Estatuto do Idoso);
+           2) professor do quadro permanente da rede pública;
+           3) idade mais elevada (data de nascimento mais antiga).
+         Ausentes e eliminados ficam fora da classificação. */
+      function rankCards() {
+        const items = S.cards.map(c => {
+          const e = rosterEntryOf(c) || {}, nasc = e.nasc || '', age = ageAt(nasc, DATA_PROVA);
+          const rede = e.rede || '', perm = e.perm || '';
+          return { c, sc: cardScore(c), nasc, rede, perm, idoso: age != null && age >= 60, permPub: rede === 'Pública' && perm === 'Sim', ranked: !c.aus && !c.eli };
+        });
+        // devolve [sinal, critério que decidiu]
+        const cmpCrit = (a, b) => {
+          if (a.sc !== b.sc) return [b.sc - a.sc, 'nota'];
+          if (a.idoso !== b.idoso) return [a.idoso ? -1 : 1, '1º critério: 60 anos ou mais (item 7.1.1.1)'];
+          if (a.idoso && b.idoso && a.nasc !== b.nasc) return [a.nasc < b.nasc ? -1 : 1, '1º critério: mais velho entre os com 60 anos ou mais (item 7.1.1.1)'];
+          if (a.permPub !== b.permPub) return [a.permPub ? -1 : 1, '2º critério: quadro permanente da rede pública (item 7.1.1.2)'];
+          if (a.nasc && b.nasc && a.nasc !== b.nasc) return [a.nasc < b.nasc ? -1 : 1, '3º critério: data de nascimento mais antiga (item 7.1.1.3)'];
+          if (!!a.nasc !== !!b.nasc) return [a.nasc ? -1 : 1, 'data de nascimento ausente na lista: conferir'];
+          return [0, 'empate não resolvido pelos critérios do edital: conferir'];
+        };
+        const byName = (a, b) => (a.c.name || '').localeCompare(b.c.name || '', 'pt-BR', { sensitivity: 'base' });
+        const ranked = items.filter(x => x.ranked).sort((a, b) => cmpCrit(a, b)[0] || byName(a, b));
+        const rest = items.filter(x => !x.ranked).sort(byName);
+        ranked.forEach((x, i) => {
+          const prev = ranked[i - 1], tied = ranked.filter(y => y.sc === x.sc).length;
+          x.ordem = i + 1;
+          x.why = prev && prev.sc === x.sc ? cmpCrit(prev, x)[1] : tied > 1 ? `empate na nota entre ${tied} candidatos` : '';
+        });
+        return { ranked, rest };
+      }
+      /* Com a lista de inscritos: aba Resultados já ordenada, com CPF mascarado (item 6.5), data de nascimento,
+         rede e quadro permanente. A nota é o número de acertos. */
+      function buildRosterResultRows() {
+        const head = ['Ordem', 'Nome', 'CPF mascarado', 'CPF', 'Nascimento', 'Rede', 'Quadro permanente',
+          'Nota', 'Situação', 'Revisão', 'Desempate (em relação ao anterior)', 'Alertas', 'Lista de inscritos']
+          .concat(Array.from({ length: NQ }, (_, i) => 'Q' + (i + 1)));
+        const { ranked, rest } = rankCards(), rows = [head];
+        const row = x => {
+          const c = x.c;
+          return [x.ordem || '', c.name || '', maskCpf(c.cpf), c.cpf || '', fmtBirth(x.nasc), x.rede, x.perm,
+            c.aus ? '' : Math.round(x.sc / NQ * S.cfg.max * 100) / 100,
+            c.aus ? 'Ausente' : c.eli ? 'Eliminado' : 'Presente',
+            c.rev ? 'Revisado' : (alertsOf(c).length ? 'Pendente' : 'Sem alertas'),
+            x.why || '', alertsOf(c).join(' | '), c.roster ? ROSTER_TXT[c.roster.status] || '' : '']
+            .concat(c.ans.map((a, q) => isDouble(c, q) ? (S.gab[q] === 5 ? 'DUPLA (anulada: ponto)' : 'DUPLA (0)') : a >= 0 ? LET[a] : ''));
+        };
+        for (const x of ranked) rows.push(row(x));
+        for (const x of rest) rows.push(row(x));
+        return rows;
+      }
+      /* Ordem das linhas da aba original (lista do SCA): primeiro os classificados, na ordem da classificação;
+         depois os eliminados com nota; depois todo o resto (ausentes, sem cartão, sem identificação segura) na
+         ordem original. Devolve { lead: [linhas 0-based na ordem], ordem: Map(linha -> nº de ordem) }. */
+      function rosterSheetOrder(chosen) {
+        const { ranked, rest } = rankCards(), lead = [], ordem = new Map(), used = new Set();
+        for (const x of ranked) { const ch = chosen.get(cpfDigits(x.c.cpf)); if (ch && !used.has(ch.row)) { lead.push(ch.row); ordem.set(ch.row, x.ordem); used.add(ch.row); } }
+        for (const x of rest) { const ch = chosen.get(cpfDigits(x.c.cpf)); if (ch && !used.has(ch.row)) { lead.push(ch.row); used.add(ch.row); } }
+        return { lead, ordem };
+      }
+      function addResultsSheetToXlsx(bytes, rows, colWidths = ROSTER.list ? RESULT_COL_WIDTHS : [38, 17, 10, 10, 13, 14, 42, 26]) {
         const zip = XLSX.CFB.read(new Uint8Array(bytes), { type: 'array' });
         const part = path => {
           const e = XLSX.CFB.find(zip, path);
@@ -4020,7 +4204,6 @@
         const numCols = rows[0].length;
         const lastCol = XLSX.utils.encode_col(numCols - 1);
         const lastRow = Math.max(rows.length, 1);
-        const colWidths = [38, 17, 10, 10, 13, 14, 42, 26];
         const cols = '<cols>' + Array.from({ length: numCols }, (_, c) =>
           `<col min="${c + 1}" max="${c + 1}" width="${colWidths[c] || 12}" customWidth="1"/>`).join('') + '</cols>';
         const xmlRows = rows.map((row, ri) => {
@@ -4081,26 +4264,32 @@
           let out;
           if (/\.xlsx$/i.test(ROSTER.file) && XLSX.CFB && XLSX.CFB.utils.cfb_add) {
             // Para .xlsx, altera só o XML da aba alvo e mantém a formatação original.
-            const graded = addGradeColumnToXlsx(ROSTER.bytes, ROSTER.sheet, hr, nextCol, chosen);
+            const graded = addGradeColumnToXlsx(ROSTER.bytes, ROSTER.sheet, hr, nextCol, chosen, rosterSheetOrder(chosen));
             out = addResultsSheetToXlsx(graded, buildResultRows());
           } else {
             // Planilhas .xls e arquivos .csv são convertidos para .xlsx.
             const sourceHeader = ws[XLSX.utils.encode_cell({ r: hr, c: range.e.c })];
-            ws[hc] = { t: 's', v: 'Nota' };
-            if (sourceHeader && sourceHeader.s != null) ws[hc].s = sourceHeader.s;
+            const hc2 = XLSX.utils.encode_cell({ r: hr, c: nextCol + 1 });
+            ws[hc] = { t: 's', v: 'Nota' }; ws[hc2] = { t: 's', v: 'Ordem' };
+            if (sourceHeader && sourceHeader.s != null) { ws[hc].s = sourceHeader.s; ws[hc2].s = sourceHeader.s; }
+            const ord = rosterSheetOrder(chosen);
             for (const { row, note } of chosen.values()) {
-              const cell = XLSX.utils.encode_cell({ r: row, c: nextCol });
-              ws[cell] = { t: 'n', v: note, z: '0.00' };
+              ws[XLSX.utils.encode_cell({ r: row, c: nextCol })] = { t: 'n', v: note, z: '0.00' };
+              if (ord.ordem.has(row)) ws[XLSX.utils.encode_cell({ r: row, c: nextCol + 1 })] = { t: 'n', v: ord.ordem.get(row) };
             }
-            range.e.c = nextCol;
+            range.e.c = nextCol + 1;
+            // reordena as linhas dos candidatos (classificados primeiro)
+            const dataRows = []; for (let r = hr + 1; r <= range.e.r; r++) dataRows.push(r);
+            const lead = ord.lead.filter(r => r > hr), newOrder = lead.concat(dataRows.filter(r => !lead.includes(r)));
+            const snap = dataRows.map(r => { const cells = []; for (let c = range.s.c; c <= range.e.c; c++) cells.push(ws[XLSX.utils.encode_cell({ r, c })]); return cells; });
+            newOrder.forEach((src, i) => { const cells = snap[src - (hr + 1)], r = hr + 1 + i; for (let c = range.s.c; c <= range.e.c; c++) { const a = XLSX.utils.encode_cell({ r, c }); if (cells[c - range.s.c]) ws[a] = cells[c - range.s.c]; else delete ws[a]; } });
             ws['!ref'] = XLSX.utils.encode_range(range);
+            if (ws['!autofilter']) ws['!autofilter'] = { ref: XLSX.utils.encode_range({ s: { r: hr, c: range.s.c }, e: { r: range.e.r, c: nextCol + 1 } }) };
             if (!ws['!cols']) ws['!cols'] = [];
-            ws['!cols'][nextCol] = { wch: 12 };
+            ws['!cols'][nextCol] = { wch: 10 }; ws['!cols'][nextCol + 1] = { wch: 10 };
             const resultRows = buildResultRows();
             const resultWs = XLSX.utils.aoa_to_sheet(resultRows);
-            resultWs['!cols'] = [{ wch: 38 }, { wch: 17 }, { wch: 10 }, { wch: 10 },
-              { wch: 13 }, { wch: 14 }, { wch: 42 }, { wch: 26 }]
-              .concat(Array(NQ).fill({ wch: 12 }));
+            resultWs['!cols'] = RESULT_COL_WIDTHS.map(w => ({ wch: w })).concat(Array(NQ).fill({ wch: 12 }));
             let resultSheetName = 'Resultados', seq = 2;
             while (wb.SheetNames.some(n => n.toLocaleLowerCase() === resultSheetName.toLocaleLowerCase()))
               resultSheetName = `Resultados (${seq++})`;
@@ -4659,11 +4848,14 @@
           try {
             const r = await readRoster(file); setRoster(r);
             await saveKV('roster', { file: r.file, list: r.list, sheet: r.sheet, headerRow: r.headerRow,
-              cpfCol: r.cpfCol, nameCol: r.nameCol, bytes: r.bytes });
+              cpfCol: r.cpfCol, nameCol: r.nameCol, bytes: r.bytes, extraCols: r.extraCols });
             const st = {}; for (const c of S.cards) { applyRoster(c); saveCard(c); st[c.roster.status] = (st[c.roster.status] || 0) + 1; }
             renderList();
             const resumo = S.cards.length ? `<br><br>Cartões já carregados: ${st.exato || 0} conferem${st.corrigido ? `, ${st.corrigido} com CPF corrigido` : ''}${st['nome-difere'] ? `, ${st['nome-difere']} com nome diferente` : ''}${st['por-nome'] ? `, ${st['por-nome']} identificados pelo nome` : ''}${st.ambiguo ? `, ${st.ambiguo} ambíguos` : ''}${st['nao-encontrado'] ? `, ${st['nao-encontrado']} fora da lista` : ''}.` : '<br><br>Os próximos PDFs carregados serão conferidos com ela.';
-            await ask(`<b>Lista de inscritos carregada</b><br>${r.list.length} inscritos lidos de ${esc(r.file)}${r.bad.length ? ` (${r.bad.length} linha(s) ignorada(s) por CPF ou nome inválido)` : ''}.${resumo}`, 'Ok', false, '');
+            const xc = r.extraCols || {}, achou = [xc.nasc >= 0 && 'data de nascimento', (xc.rede >= 0 || xc.redePub >= 0 || xc.redePriv >= 0) && 'rede (pública/privada)', (xc.perm >= 0 || (xc.rede >= 0 && r.list.some(e => e.perm))) && 'quadro permanente'].filter(Boolean);
+            const faltou = ['data de nascimento', 'rede (pública/privada)', 'quadro permanente'].filter(x => !achou.includes(x));
+            const extra = `<br><br>Dados para o desempate (edital, item 7.1.1): ${achou.length ? 'encontrei ' + achou.join(', ') : 'nenhum encontrado'}.${faltou.length ? ` Sem ${faltou.join(', ')}, esse critério fica em branco na aba Resultados.` : ''}`;
+            await ask(`<b>Lista de inscritos carregada</b><br>${r.list.length} inscritos lidos de ${esc(r.file)}${r.bad.length ? ` (${r.bad.length} linha(s) ignorada(s) por CPF ou nome inválido)` : ''}.${resumo}${extra}`, 'Ok', false, '');
           } catch (err) { await ask(`<b>Não foi possível ler a lista</b><br>${esc(err.message)}<br>Use uma planilha com uma coluna "Nome" e uma coluna "CPF".`, 'Ok', false, ''); }
         }
         else if (t.id === 'fImg') { const f = t.files; await importImages(f); t.value = ''; }
