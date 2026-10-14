@@ -3430,6 +3430,8 @@
         ROSTER.headerRow = r && Number.isInteger(r.headerRow) ? r.headerRow : 0;
         ROSTER.cpfCol = r && Number.isInteger(r.cpfCol) ? r.cpfCol : null;
         ROSTER.nameCol = r && Number.isInteger(r.nameCol) ? r.nameCol : null;
+        ROSTER.inst = r ? (r.inst || null) : null;
+        ROSTER.vagas = r && Number.isInteger(r.vagas) ? r.vagas : null;
         ROSTER.byCpf = new Map();
         if (ROSTER.list) for (const e of ROSTER.list) {
           // CPF repetido no cadastro nunca pode ser associado automaticamente.
@@ -3563,7 +3565,15 @@
               list.push(e);
             } else bad.push(i + 1);
           }
-          if (!best || list.length > best.list.length) best = { list, bad, sheet: sn, headerRow: Math.max(0, hr), cpfCol: cc, nameCol: nc, extraCols: ext };
+          // instituição/campus (lista do SCA: sigla_instituicao, cidade_instituicao, cidade_uf): valor mais frequente
+          let inst = null;
+          if (hr >= 0) {
+            const h = (rows[hr] || []).map(_hdr), col = re => h.findIndex(v => re.test(v));
+            const ks = col(/SIGLA/), kc = col(/CIDADE INSTITUIC|CAMPUS|CIDADE DO CAMPUS/), ku = col(/CIDADE UF|^UF INSTITUIC/);
+            const mode = k => { if (k < 0) return ''; const m = new Map(); for (const e of list) { const v = String(rows[e.row][k] || '').trim(); if (v) m.set(v, (m.get(v) || 0) + 1); } return [...m].sort((a, b) => b[1] - a[1])[0]?.[0] || ''; };
+            if (ks >= 0) inst = { sigla: mode(ks), cidade: mode(kc), uf: mode(ku) };
+          }
+          if (!best || list.length > best.list.length) best = { list, bad, sheet: sn, headerRow: Math.max(0, hr), cpfCol: cc, nameCol: nc, extraCols: ext, inst };
         }
         if (!best || !best.list.length) throw new Error('Não encontrei colunas de nome e CPF válidos neste arquivo.');
         return { file: file.name, bytes, ...best };
@@ -4018,9 +4028,11 @@
         if (!target || target.includes('..')) throw new Error('Endereço interno da aba inválido.');
         const worksheetPath = target.startsWith('/') ? target : '/xl/' + target.replace(/^xl\//, '');
         let xml = decode(worksheetPath);
-        const noteLab = XLSX.utils.encode_col(noteCol), ordLab = XLSX.utils.encode_col(noteCol + 1);
+        const noteLab = XLSX.utils.encode_col(noteCol), ordLab = XLSX.utils.encode_col(noteCol + 1), posLab = XLSX.utils.encode_col(noteCol + 2);
         const notes = new Map([...selected.values()].map(e => [e.row + 1, e.note]));
-        const ordem = new Map([...(order ? order.ordem : new Map())].map(([r, o]) => [r + 1, o]));
+        const info = new Map([...(order ? order.info : new Map())].map(([r, o]) => [r + 1, o]));
+        const xmlSafe = v => String(v).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+        const taken = (p) => [noteLab, ordLab, posLab].some(l => p.inside.includes(`r="${l}${p.num}"`));
         const hdrNum = headerRow + 1;
         const sd = xml.match(/<sheetData\b[^>]*>([\s\S]*?)<\/sheetData>|<sheetData\b[^>]*\/>/);
         if (!sd) throw new Error('Aba sem dados.');
@@ -4034,19 +4046,21 @@
         for (const p of parsed) {
           const add = [];
           if (p.num === hdrNum) {
-            if (p.inside.includes(`r="${noteLab}${p.num}"`) || p.inside.includes(`r="${ordLab}${p.num}"`)) throw new Error('As colunas de nota e ordem já possuem conteúdo.');
+            if (taken(p)) throw new Error('As colunas de nota e lista já possuem conteúdo.');
             const st = p.inside.match(/<c\b[^>]*\bs="(\d+)"/); headerStyle = st ? ' s="' + st[1] + '"' : '';
-            add.push(`<c r="${noteLab}${p.num}"${headerStyle} t="inlineStr"><is><t>Nota</t></is></c>`, `<c r="${ordLab}${p.num}"${headerStyle} t="inlineStr"><is><t>Ordem</t></is></c>`);
+            add.push(`<c r="${noteLab}${p.num}"${headerStyle} t="inlineStr"><is><t>Nota</t></is></c>`, `<c r="${ordLab}${p.num}"${headerStyle} t="inlineStr"><is><t>Lista</t></is></c>`, `<c r="${posLab}${p.num}"${headerStyle} t="inlineStr"><is><t>Posição</t></is></c>`);
           } else {
             if (notes.has(p.num)) {
               const note = notes.get(p.num); if (!Number.isFinite(note)) throw new Error('Foi encontrada uma nota inválida.');
               add.push(`<c r="${noteLab}${p.num}" t="n"><v>${note}</v></c>`); notes.delete(p.num);
             }
-            if (ordem.has(p.num)) add.push(`<c r="${ordLab}${p.num}" t="n"><v>${ordem.get(p.num)}</v></c>`);
+            const inf = info.get(p.num);
+            if (inf && inf.lista) add.push(`<c r="${ordLab}${p.num}" t="inlineStr"><is><t>${xmlSafe(inf.lista)}</t></is></c>`);
+            if (inf && Number.isFinite(inf.pos)) add.push(`<c r="${posLab}${p.num}" t="n"><v>${inf.pos}</v></c>`);
           }
-          if (add.length && (p.inside.includes(`r="${noteLab}${p.num}"`) || p.inside.includes(`r="${ordLab}${p.num}"`))) throw new Error('As colunas de nota e ordem já possuem conteúdo.');
+          if (add.length && p.num !== hdrNum && taken(p)) throw new Error('As colunas de nota e lista já possuem conteúdo.');
           p.inside += add.join('');
-          p.open = p.open.replace(/\bspans="(\d+):(\d+)"/, (m, a1, b1) => `spans="${a1}:${Math.max(+b1, noteCol + 2)}"`);
+          p.open = p.open.replace(/\bspans="(\d+):(\d+)"/, (m, a1, b1) => `spans="${a1}:${Math.max(+b1, noteCol + 3)}"`);
         }
         if (!parsed.some(p => p.num === hdrNum)) throw new Error('A linha do cabeçalho não existe no arquivo.');
         if (notes.size) throw new Error('Uma ou mais linhas dos candidatos não foram encontradas.');
@@ -4068,19 +4082,48 @@
         }
         const body = outRows.map(p => p.open + p.inside + '</row>').join('');
         xml = xml.replace(sd[0], (sd[0].match(/^<sheetData\b[^>]*?(?=\/?>)/)[0]) + '>' + body + '</sheetData>');
-        const widen = ref => { const rg = XLSX.utils.decode_range(ref.replace(/\$/g, '')); rg.e.c = Math.max(rg.e.c, noteCol + 1); return XLSX.utils.encode_range(rg); };
+        const widen = ref => { const rg = XLSX.utils.decode_range(ref.replace(/\$/g, '')); rg.e.c = Math.max(rg.e.c, noteCol + 2); return XLSX.utils.encode_range(rg); };
         xml = xml.replace(/(<dimension\b[^>]*\bref=")([^"]+)(")/, (m, a1, ref, b1) => a1 + widen(ref) + b1);
         xml = xml.replace(/(<autoFilter\b[^>]*\bref=")([^"]+)(")/, (m, a1, ref, b1) => a1 + widen(ref) + b1);
-        if (/<\/cols>/.test(xml)) xml = xml.replace(/<\/cols>/, `<col min="${noteCol + 1}" max="${noteCol + 1}" width="10" customWidth="1"/><col min="${noteCol + 2}" max="${noteCol + 2}" width="10" customWidth="1"/></cols>`);
+        if (/<\/cols>/.test(xml)) xml = xml.replace(/<\/cols>/, `<col min="${noteCol + 1}" max="${noteCol + 1}" width="10" customWidth="1"/><col min="${noteCol + 2}" max="${noteCol + 2}" width="38" customWidth="1"/><col min="${noteCol + 3}" max="${noteCol + 3}" width="10" customWidth="1"/></cols>`);
         XLSX.CFB.utils.cfb_add(zip, worksheetPath, new TextEncoder().encode(xml));
         // intervalo do filtro guardado no livro (_FilterDatabase) acompanha as novas colunas
         const idx = sheetTags.indexOf(sheetTag);
         bookXml = bookXml.replace(/(<definedName\b[^>]*name="_xlnm\._FilterDatabase"[^>]*localSheetId="(\d+)"[^>]*>)([^<]*)(<\/definedName>)/g, (m, open, sid, ref, close) => {
           if (+sid !== idx) return m;
-          return open + ref.replace(/\$([A-Z]+)\$(\d+)(?=[^:]*$)/, (mm, col, row) => '$' + XLSX.utils.encode_col(Math.max(XLSX.utils.decode_col(col), noteCol + 1)) + '$' + row) + close;
+          return open + ref.replace(/\$([A-Z]+)\$(\d+)(?=[^:]*$)/, (mm, col, row) => '$' + XLSX.utils.encode_col(Math.max(XLSX.utils.decode_col(col), noteCol + 2)) + '$' + row) + close;
         });
         XLSX.CFB.utils.cfb_add(zip, '/xl/workbook.xml', new TextEncoder().encode(bookXml));
         return XLSX.CFB.write(zip, { type: 'array', fileType: 'zip', compression: true });
+      }
+      const VAGAS_ANEXO2 = [["CEFET","Belo Horizonte","MG",20],["CPII","Rio de Janeiro","RJ",25],["UNIR","Ji-Parana","RO",10],["UNIR","Porto Velho","RO",15],["UFABC","Santo André","SP",30],["IFSP","São Paulo","SP",30],["IFPI","Floriano","PI",30],["IFRS","Canoas","RS",15],["PUC-Rio","Rio de Janeiro","RJ",20],["UnB","Brasília","DF",35],["USP","São Paulo","SP",20],["UNEMAT","Barra do Bugres","MT",15],["UNEMAT","Sinop","MT",15],["UDESC","Joinville","SC",14],["UEA","Manaus","AM",20],["UERJ","Rio de Janeiro","RJ",36],["UERJ","São Gonçalo","RJ",20],["UEPB","Campina Grande","PB",22],["UNICAMP","Campinas","SP",18],["UEFS","Feira de Santana","BA",18],["UEL","Londrina","PR",8],["UEM","Maringá","PR",20],["UEMS","Dourados","MS",12],["UEPG","Ponta Grossa","PR",13],["UESC","Ilhéus","BA",18],["UECE","Fortaleza","CE",15],["UECE","Quixadá","CE",15],["UEMA","Balsas","MA",16],["UEMA","São Luís","MA",24],["UNIOESTE","Cascavel","PR",15],["UESPI","Teresina","PI",20],["UESB","Vitória da Conquista","BA",25],["UVA","Sobral","CE",11],["UNESP","Bauru","SP",10],["UNESP","Rio Claro","SP",10],["UNESP","São José do Rio Preto","SP",7],["UFBA","Salvador","BA",20],["UFFS","Chapecó","SC",18],["UFGD","Dourados","MS",10],["UFPB","João Pessoa","PB",15],["UFAL","Arapiraca","AL",20],["UFAL","Maceió","AL",30],["UNIFAL","Alfenas","MG",15],["UFCG","Campina Grande","PB",20],["UFCAT","Catalão","GO",16],["UFG","Goiânia","GO",30],["UFJ","Jataí","GO",13],["UFJF","Juiz de Fora","MG",15],["UFLA","Lavras","MG",13],["UFMT","Barra do Garças","MT",10],["UFMT","Cuiabá","MT",25],["UFMS","Campo Grande","MS",15],["UFMS","Três Lagoas","MS",18],["UFOP","Ouro Preto","MG",12],["UFPE","Caruaru","PE",10],["UFR","Rondonópolis","MT",9],["UFRR","Boa Vista","RR",15],["UFSC","Blumenau","SC",20],["UFSC","Florianópolis","SC",15],["UFSM","Santa Maria","RS",10],["UFSCAR","São Carlos","SP",10],["UFSJ","Ouro Branco","MG",15],["UFSJ","São João del Rei","MG",10],["UNIFESP","Diadema","SP",12],["UNIFESP","São José dos Campos","SP",20],["FUFS","Aracaju","SE",20],["FUFS","Itabaiana","SE",10],["UFU","Uberlândia","MG",18],["UFV","Florestal","MG",20],["UFAC","Rio Branco","AC",15],["UNIFAP","Macapá","AP",13],["UFCA","Juazeiro do Norte","CE",20],["UFC","Fortaleza","CE",10],["UFDPar","Parnaíba","PI",10],["UFES","Vitória","ES",25],["UNIRIO","Rio de Janeiro","RJ",20],["UFMA","São Luis","MA",22],["UFNT","Araguaina","TO",10],["UFOB","Barreiras","BA",18],["UFOPA","Santarém","PA",13],["UNIPAMPA","Caçapava do Sul","RS",7],["UFPA","Abaetetuba","PA",20],["UFPA","Belém","PA",22],["UFPA","Bragança","PA",15],["UFPA","Cametá","PA",14],["UFPA","Castanhal","PA",15],["UFPR","Curitiba","PR",10],["UFPI","Teresina","PI",28],["UFRB","Cruz das Almas","BA",16],["UFRJ","Rio de Janeiro","RJ",20],["FURG","Rio Grande","RS",8],["UFRN","Natal","RN",15],["UFT","Arraias","TO",20],["UFTM","Uberaba","MG",16],["UNIVASF","Juazeiro","BA",20],["UFVJM","Teófilo Otoni","MG",15],["UFF","Niterói","RJ",20],["UFRPE","Recife","PE",30],["UFRRJ","Seropédica","RJ",20],["UFERSA","Mossoró","RN",30],["URCA","Juazeiro do Norte","CE",10],["UTFPR","Cornélio Procópio","PR",20],["UTFPR","Curitiba","PR",30],["UTFPR","Pato Branco","PR",10],["UTFPR","Toledo","PR",12],["UNILAB","Redenção","CE",15],["UENF","Campos dos Goytacazes","RJ",18]];
+      /* vagas da instituição/campus no Anexo 2 do edital (sigla + cidade da lista do SCA) */
+      function vagasAnexo2(inst) {
+        if (!inst || !inst.sigla) return null;
+        const n = v => String(v || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toUpperCase().replace(/[^A-Z0-9]/g, '');
+        const rows = VAGAS_ANEXO2.filter(r => n(r[0]) === n(inst.sigla));
+        if (rows.length === 1) return { vagas: rows[0][3], campus: rows[0][0] + ' – ' + rows[0][1] };
+        const r = rows.find(r => n(r[1]) === n(inst.cidade)) || (inst.uf ? null : null);
+        return r ? { vagas: r[3], campus: r[0] + ' – ' + r[1] } : null;
+      }
+      /* pergunta o número de vagas (pré-preenchido pelo Anexo 2); null se cancelar */
+      function askVagas() {
+        const a2 = vagasAnexo2(ROSTER.inst), def = Number.isInteger(ROSTER.vagas) ? ROSTER.vagas : a2 ? a2.vagas : '';
+        const origem = a2 ? `No Anexo 2 do edital, ${esc(a2.campus)} tem <b>${a2.vagas}</b> vagas.` : 'Não encontrei esta instituição no Anexo 2 do edital.';
+        return new Promise(res => {
+          const d = $('#dlg'); d.hidden = false;
+          d.innerHTML = `<div class="busybox"><p style="margin:0 0 10px"><b>Vagas para a Lista 1</b><br>${origem} Confirme o número de vagas
+            (ou o número atualizado pela CAN). Ele separa, entre os aprovados da rede pública, os classificados (Lista 1) dos demais (Lista 2).</p>
+            <input id="vagasIn" class="txt" type="number" min="0" step="1" value="${def}" style="max-width:140px;margin:0 0 14px">
+            <div class="row" style="justify-content:flex-end"><button class="btn" data-r="0">Cancelar</button><button class="btn pri" data-r="1">Exportar</button></div></div>`;
+          const inp = $('#vagasIn'); setTimeout(() => inp && inp.focus(), 0);
+          d.onclick = e => {
+            const b = e.target.closest('[data-r]'); if (!b) return;
+            const v = Math.round(Number(inp.value));
+            if (b.dataset.r === '1' && !(Number.isFinite(v) && v >= 0 && inp.value !== '')) { inp.style.borderColor = 'var(--bad)'; inp.focus(); return; }
+            d.hidden = true; d.innerHTML = ''; res(b.dataset.r === '1' ? v : null);
+          };
+        });
       }
       const DATA_PROVA = '2026-10-10';   // ENA 2027 (edital nº 23/2026): só define quem tem 60 anos ou mais (item 7.1.1.1)
       function buildResultRows() {
@@ -4108,23 +4151,31 @@
            2) professor do quadro permanente da rede pública;
            3) idade mais elevada.
          Ausentes e eliminados vão ao final, sem ordem de classificação. */
-      const RESULT_COL_WIDTHS = [7, 38, 16, 16, 12, 9, 11, 9, 11, 12, 34, 42, 26];
+      const RESULT_COL_WIDTHS = [36, 8, 38, 16, 16, 12, 9, 11, 9, 11, 12, 34, 42, 26];
       function rosterEntryOf(c) {
         const d = cpfDigits(c.cpf);
         return (d && ROSTER.byCpf.get(d)) || (c.roster && c.roster.cpf && ROSTER.byCpf.get(c.roster.cpf)) || null;
       }
-      /* Classificação pela nota e pelos critérios de desempate do edital (item 7.1.1), sucessivamente:
+      /* Classificação conforme o edital (itens 6.4, 7.1.1, 7.1.3 e 7.2).
+         Só entram nas listas os aprovados (50% ou mais de acertos). A rede pública tem prioridade total sobre a
+         privada (item 7.1.3), então a ordem é:
+           Lista 1  rede pública, aprovados, dentro do número de vagas da instituição;
+           Lista 2  rede pública, aprovados, além das vagas;
+           Lista 3  rede privada, aprovados;
+         depois os aprovados sem rede informada na lista (a conferir), os reprovados, os eliminados e os ausentes.
+         Dentro de cada lista: nota e, sucessivamente (item 7.1.1),
            1) idade mais elevada entre os candidatos com 60 anos ou mais na data da prova (Estatuto do Idoso);
            2) professor do quadro permanente da rede pública;
            3) idade mais elevada (data de nascimento mais antiga).
-         Ausentes e eliminados ficam fora da classificação. */
-      function rankCards() {
+         Cotas de cada instituição (item 7.1.3) não entram aqui. */
+      const LISTA_TXT = { L1: 'Lista 1 – Rede pública (classificado)', L2: 'Lista 2 – Rede pública (aprovado)', L3: 'Lista 3 – Rede privada (aprovado)',
+        SR: 'Aprovado sem rede informada (conferir)', RP: 'Reprovado (menos de 50%)', EL: 'Eliminado', AU: 'Ausente' };
+      function rankCards(vagas) {
         const items = S.cards.map(c => {
           const e = rosterEntryOf(c) || {}, nasc = e.nasc || '', age = ageAt(nasc, DATA_PROVA);
-          const rede = e.rede || '', perm = e.perm || '';
-          return { c, sc: cardScore(c), nasc, rede, perm, idoso: age != null && age >= 60, permPub: rede === 'Pública' && perm === 'Sim', ranked: !c.aus && !c.eli };
+          const rede = e.rede || '', perm = e.perm || '', sc = cardScore(c);
+          return { c, sc, nasc, rede, perm, idoso: age != null && age >= 60, permPub: rede === 'Pública' && perm === 'Sim', aprov: sc * 2 >= NQ };
         });
-        // devolve [sinal, critério que decidiu]
         const cmpCrit = (a, b) => {
           if (a.sc !== b.sc) return [b.sc - a.sc, 'nota'];
           if (a.idoso !== b.idoso) return [a.idoso ? -1 : 1, '1º critério: 60 anos ou mais (item 7.1.1.1)'];
@@ -4135,43 +4186,57 @@
           return [0, 'empate não resolvido pelos critérios do edital: conferir'];
         };
         const byName = (a, b) => (a.c.name || '').localeCompare(b.c.name || '', 'pt-BR', { sensitivity: 'base' });
-        const ranked = items.filter(x => x.ranked).sort((a, b) => cmpCrit(a, b)[0] || byName(a, b));
-        const rest = items.filter(x => !x.ranked).sort(byName);
-        ranked.forEach((x, i) => {
-          const prev = ranked[i - 1], tied = ranked.filter(y => y.sc === x.sc).length;
-          x.ordem = i + 1;
+        const sortRank = arr => arr.sort((a, b) => cmpCrit(a, b)[0] || byName(a, b));
+        const live = items.filter(x => !x.c.aus && !x.c.eli);
+        const pub = sortRank(live.filter(x => x.aprov && x.rede === 'Pública'));
+        const priv = sortRank(live.filter(x => x.aprov && x.rede === 'Privada'));
+        const semRede = sortRank(live.filter(x => x.aprov && !x.rede));
+        const reprov = sortRank(live.filter(x => !x.aprov));
+        const elim = sortRank(items.filter(x => x.c.eli && !x.c.aus)), aus = items.filter(x => x.c.aus).sort(byName);
+        const V = Number.isInteger(vagas) ? vagas : Infinity;
+        const mark = (arr, grp, posFrom) => arr.forEach((x, i) => {
+          const prev = arr[i - 1], tied = arr.filter(y => y.sc === x.sc).length;
+          x.grp = typeof grp === 'function' ? grp(i) : grp;
+          x.pos = posFrom ? i + 1 : '';
           x.why = prev && prev.sc === x.sc ? cmpCrit(prev, x)[1] : tied > 1 ? `empate na nota entre ${tied} candidatos` : '';
         });
-        return { ranked, rest };
+        mark(pub, i => i < V ? 'L1' : 'L2', true);
+        mark(priv, 'L3', true);
+        mark(semRede, 'SR', false); mark(reprov, 'RP', false); mark(elim, 'EL', false); mark(aus, 'AU', false);
+        for (const x of aus) x.why = '';
+        // ordem final: Lista 1, Lista 2, Lista 3, sem rede, reprovados, eliminados, ausentes
+        return { order: [...pub, ...priv, ...semRede, ...reprov, ...elim, ...aus], vagas: Number.isInteger(vagas) ? vagas : null };
       }
       /* Com a lista de inscritos: aba Resultados já ordenada, com CPF mascarado (item 6.5), data de nascimento,
          rede e quadro permanente. A nota é o número de acertos. */
       function buildRosterResultRows() {
-        const head = ['Ordem', 'Nome', 'CPF mascarado', 'CPF', 'Nascimento', 'Rede', 'Quadro permanente',
+        const head = ['Lista', 'Posição', 'Nome', 'CPF mascarado', 'CPF', 'Nascimento', 'Rede', 'Quadro permanente',
           'Nota', 'Situação', 'Revisão', 'Desempate (em relação ao anterior)', 'Alertas', 'Lista de inscritos']
           .concat(Array.from({ length: NQ }, (_, i) => 'Q' + (i + 1)));
-        const { ranked, rest } = rankCards(), rows = [head];
+        const { order } = rankCards(ROSTER.vagas), rows = [head];
         const row = x => {
           const c = x.c;
-          return [x.ordem || '', c.name || '', maskCpf(c.cpf), c.cpf || '', fmtBirth(x.nasc), x.rede, x.perm,
+          return [LISTA_TXT[x.grp] || '', x.pos, c.name || '', maskCpf(c.cpf), c.cpf || '', fmtBirth(x.nasc), x.rede, x.perm,
             c.aus ? '' : Math.round(x.sc / NQ * S.cfg.max * 100) / 100,
             c.aus ? 'Ausente' : c.eli ? 'Eliminado' : 'Presente',
             c.rev ? 'Revisado' : (alertsOf(c).length ? 'Pendente' : 'Sem alertas'),
             x.why || '', alertsOf(c).join(' | '), c.roster ? ROSTER_TXT[c.roster.status] || '' : '']
             .concat(c.ans.map((a, q) => isDouble(c, q) ? (S.gab[q] === 5 ? 'DUPLA (anulada: ponto)' : 'DUPLA (0)') : a >= 0 ? LET[a] : ''));
         };
-        for (const x of ranked) rows.push(row(x));
-        for (const x of rest) rows.push(row(x));
+        for (const x of order) rows.push(row(x));
         return rows;
       }
-      /* Ordem das linhas da aba original (lista do SCA): primeiro os classificados, na ordem da classificação;
-         depois os eliminados com nota; depois todo o resto (ausentes, sem cartão, sem identificação segura) na
-         ordem original. Devolve { lead: [linhas 0-based na ordem], ordem: Map(linha -> nº de ordem) }. */
+      /* Ordem das linhas da aba original (lista do SCA): a mesma das listas do edital (Lista 1, 2, 3, sem rede,
+         reprovados, eliminados); depois todo o resto (ausentes, sem cartão, sem identificação segura) na ordem
+         original. Devolve { lead: [linhas 0-based na ordem], info: Map(linha -> { lista, pos }) }. */
       function rosterSheetOrder(chosen) {
-        const { ranked, rest } = rankCards(), lead = [], ordem = new Map(), used = new Set();
-        for (const x of ranked) { const ch = chosen.get(cpfDigits(x.c.cpf)); if (ch && !used.has(ch.row)) { lead.push(ch.row); ordem.set(ch.row, x.ordem); used.add(ch.row); } }
-        for (const x of rest) { const ch = chosen.get(cpfDigits(x.c.cpf)); if (ch && !used.has(ch.row)) { lead.push(ch.row); used.add(ch.row); } }
-        return { lead, ordem };
+        const { order } = rankCards(ROSTER.vagas), lead = [], info = new Map(), used = new Set();
+        for (const x of order) {
+          if (x.c.aus) continue;
+          const ch = chosen.get(cpfDigits(x.c.cpf));
+          if (ch && !used.has(ch.row)) { lead.push(ch.row); info.set(ch.row, { lista: LISTA_TXT[x.grp] || '', pos: x.pos }); used.add(ch.row); }
+        }
+        return { lead, info };
       }
       function addResultsSheetToXlsx(bytes, rows, colWidths = ROSTER.list ? RESULT_COL_WIDTHS : [38, 17, 10, 10, 13, 14, 42, 26]) {
         const zip = XLSX.CFB.read(new Uint8Array(bytes), { type: 'array' });
@@ -4251,6 +4316,9 @@
           return;
         }
         try { await loadLib('xlsx'); } catch (e) { return toast(e.message, 4000); }
+        const vagas = await askVagas(); if (vagas == null) return;
+        ROSTER.vagas = vagas;
+        try { const k = (await DB.all('kv')).find(x => x.k === 'roster'); if (k && k.v) { k.v.vagas = vagas; await saveKV('roster', k.v); } } catch (e) { console.warn(e); }
         try {
           const wb = XLSX.read(ROSTER.bytes, { type: 'array', cellStyles: true });
           const ws = wb.Sheets[ROSTER.sheet];
@@ -4269,24 +4337,26 @@
           } else {
             // Planilhas .xls e arquivos .csv são convertidos para .xlsx.
             const sourceHeader = ws[XLSX.utils.encode_cell({ r: hr, c: range.e.c })];
-            const hc2 = XLSX.utils.encode_cell({ r: hr, c: nextCol + 1 });
-            ws[hc] = { t: 's', v: 'Nota' }; ws[hc2] = { t: 's', v: 'Ordem' };
-            if (sourceHeader && sourceHeader.s != null) { ws[hc].s = sourceHeader.s; ws[hc2].s = sourceHeader.s; }
+            const hc2 = XLSX.utils.encode_cell({ r: hr, c: nextCol + 1 }), hc3 = XLSX.utils.encode_cell({ r: hr, c: nextCol + 2 });
+            ws[hc] = { t: 's', v: 'Nota' }; ws[hc2] = { t: 's', v: 'Lista' }; ws[hc3] = { t: 's', v: 'Posição' };
+            if (sourceHeader && sourceHeader.s != null) { ws[hc].s = sourceHeader.s; ws[hc2].s = sourceHeader.s; ws[hc3].s = sourceHeader.s; }
             const ord = rosterSheetOrder(chosen);
             for (const { row, note } of chosen.values()) {
               ws[XLSX.utils.encode_cell({ r: row, c: nextCol })] = { t: 'n', v: note, z: '0.00' };
-              if (ord.ordem.has(row)) ws[XLSX.utils.encode_cell({ r: row, c: nextCol + 1 })] = { t: 'n', v: ord.ordem.get(row) };
+              const inf = ord.info.get(row);
+              if (inf && inf.lista) ws[XLSX.utils.encode_cell({ r: row, c: nextCol + 1 })] = { t: 's', v: inf.lista };
+              if (inf && Number.isFinite(inf.pos)) ws[XLSX.utils.encode_cell({ r: row, c: nextCol + 2 })] = { t: 'n', v: inf.pos };
             }
-            range.e.c = nextCol + 1;
+            range.e.c = nextCol + 2;
             // reordena as linhas dos candidatos (classificados primeiro)
             const dataRows = []; for (let r = hr + 1; r <= range.e.r; r++) dataRows.push(r);
             const lead = ord.lead.filter(r => r > hr), newOrder = lead.concat(dataRows.filter(r => !lead.includes(r)));
             const snap = dataRows.map(r => { const cells = []; for (let c = range.s.c; c <= range.e.c; c++) cells.push(ws[XLSX.utils.encode_cell({ r, c })]); return cells; });
             newOrder.forEach((src, i) => { const cells = snap[src - (hr + 1)], r = hr + 1 + i; for (let c = range.s.c; c <= range.e.c; c++) { const a = XLSX.utils.encode_cell({ r, c }); if (cells[c - range.s.c]) ws[a] = cells[c - range.s.c]; else delete ws[a]; } });
             ws['!ref'] = XLSX.utils.encode_range(range);
-            if (ws['!autofilter']) ws['!autofilter'] = { ref: XLSX.utils.encode_range({ s: { r: hr, c: range.s.c }, e: { r: range.e.r, c: nextCol + 1 } }) };
+            if (ws['!autofilter']) ws['!autofilter'] = { ref: XLSX.utils.encode_range({ s: { r: hr, c: range.s.c }, e: { r: range.e.r, c: nextCol + 2 } }) };
             if (!ws['!cols']) ws['!cols'] = [];
-            ws['!cols'][nextCol] = { wch: 10 }; ws['!cols'][nextCol + 1] = { wch: 10 };
+            ws['!cols'][nextCol] = { wch: 10 }; ws['!cols'][nextCol + 1] = { wch: 38 }; ws['!cols'][nextCol + 2] = { wch: 10 };
             const resultRows = buildResultRows();
             const resultWs = XLSX.utils.aoa_to_sheet(resultRows);
             resultWs['!cols'] = RESULT_COL_WIDTHS.map(w => ({ wch: w })).concat(Array(NQ).fill({ wch: 12 }));
@@ -4848,7 +4918,7 @@
           try {
             const r = await readRoster(file); setRoster(r);
             await saveKV('roster', { file: r.file, list: r.list, sheet: r.sheet, headerRow: r.headerRow,
-              cpfCol: r.cpfCol, nameCol: r.nameCol, bytes: r.bytes, extraCols: r.extraCols });
+              cpfCol: r.cpfCol, nameCol: r.nameCol, bytes: r.bytes, extraCols: r.extraCols, inst: r.inst, vagas: null });
             const st = {}; for (const c of S.cards) { applyRoster(c); saveCard(c); st[c.roster.status] = (st[c.roster.status] || 0) + 1; }
             renderList();
             const resumo = S.cards.length ? `<br><br>Cartões já carregados: ${st.exato || 0} conferem${st.corrigido ? `, ${st.corrigido} com CPF corrigido` : ''}${st['nome-difere'] ? `, ${st['nome-difere']} com nome diferente` : ''}${st['por-nome'] ? `, ${st['por-nome']} identificados pelo nome` : ''}${st.ambiguo ? `, ${st.ambiguo} ambíguos` : ''}${st['nao-encontrado'] ? `, ${st['nao-encontrado']} fora da lista` : ''}.` : '<br><br>Os próximos PDFs carregados serão conferidos com ela.';
