@@ -3479,23 +3479,27 @@
          nome_candidato, cpf, data_nascimento, professor_rede_publica, permanente_rede_publica, professor_rede_privada,
          sigla_instituicao, cidade_instituicao. As colunas são lidas pelo nome exato, sem procurar pelo conteúdo. */
       const SCA_COLS = { nome: 'nome_candidato', cpf: 'cpf', nasc: 'data_nascimento', pub: 'professor_rede_publica',
-        perm: 'permanente_rede_publica', priv: 'professor_rede_privada', sigla: 'sigla_instituicao', cidade: 'cidade_instituicao', uf: 'cidade_uf' };
+        perm: 'permanente_rede_publica', priv: 'professor_rede_privada', sigla: 'sigla_instituicao', cidade: 'cidade_instituicao', uf: 'cidade_uf',
+        raca: 'raca_cor', genero: 'genero' };
       const scaCol = (header, key) => (header || []).findIndex(v => String(v == null ? '' : v).trim().toLowerCase() === SCA_COLS[key]);
       function rosterExtraCols(rows, hr, cc, nc) {
-        const out = { nasc: -1, rede: -1, redePub: -1, redePriv: -1, perm: -1, permPub: false, sca: false };
+        const out = { nasc: -1, rede: -1, redePub: -1, redePriv: -1, perm: -1, permPub: false, sca: false, raca: -1, genero: -1 };
         if (hr < 0) return out;
         const H = rows[hr] || [];
         // planilha do SCA: colunas pelo nome exato
         if (scaCol(H, 'pub') >= 0 || scaCol(H, 'priv') >= 0) {
           out.sca = true;
           out.nasc = scaCol(H, 'nasc'); out.redePub = scaCol(H, 'pub'); out.redePriv = scaCol(H, 'priv'); out.perm = scaCol(H, 'perm'); out.permPub = true;
+          out.raca = scaCol(H, 'raca'); out.genero = scaCol(H, 'genero');
           return out;
         }
         // outra planilha: só pelo nome do cabeçalho (nunca pelo conteúdo)
         const h = H.map(_hdr), skip = k => k === cc || k === nc;
         for (let k = 0; k < h.length; k++) {
           if (skip(k) || !h[k]) continue;
-          if (out.perm < 0 && /PERMANENTE|EFETIV|QUADRO|CONCURSAD|VINCULO|ESTATUTARI/.test(h[k])) out.perm = k;
+          if (out.raca < 0 && /^RACA|RACA COR|COR RACA|^COR$/.test(h[k])) out.raca = k;
+          else if (out.genero < 0 && /^GENERO|^SEXO/.test(h[k])) out.genero = k;
+          else if (out.perm < 0 && /PERMANENTE|EFETIV|QUADRO|CONCURSAD|VINCULO|ESTATUTARI/.test(h[k])) out.perm = k;
           else if (out.nasc < 0 && /NASC/.test(h[k])) out.nasc = k;
           else if (!/INSTITUIC/.test(h[k]) && /\bREDE\b|PUBLICA|PRIVADA/.test(h[k])) {
             const pub = /PUBLIC/.test(h[k]), priv = /PRIVAD/.test(h[k]);
@@ -3557,6 +3561,8 @@
             if (cpf.length === 11 && cpfValido(cpf) && nome) {
               const e = { nome, cpf, row: i };
               if (ext.nasc >= 0) e.nasc = parseBirth(rows[i][ext.nasc]);
+              if (ext.raca >= 0) e.raca = String(rows[i][ext.raca] ?? '').trim();
+              if (ext.genero >= 0) e.genero = String(rows[i][ext.genero] ?? '').trim();
               // perguntas "professor da rede pública?" / "professor da rede privada?" (SCA) mandam; uma coluna
               // genérica de rede só é usada se elas não existirem ou não responderem
               const pub = ext.redePub >= 0 ? parseSimNao(rows[i][ext.redePub]) : '', priv = ext.redePriv >= 0 ? parseSimNao(rows[i][ext.redePriv]) : '';
@@ -4156,7 +4162,7 @@
            2) professor do quadro permanente da rede pública;
            3) idade mais elevada.
          Ausentes e eliminados vão ao final, sem ordem de classificação. */
-      const RESULT_COL_WIDTHS = [36, 8, 38, 16, 16, 12, 9, 11, 9, 11, 12, 34, 42, 26];
+      const RESULT_COL_WIDTHS = [36, 8, 38, 16, 16, 12, 9, 11, 14, 20, 9, 11, 12, 34, 42, 26];
       function rosterEntryOf(c) {
         const d = cpfDigits(c.cpf);
         return (d && ROSTER.byCpf.get(d)) || (c.roster && c.roster.cpf && ROSTER.byCpf.get(c.roster.cpf)) || null;
@@ -4179,7 +4185,7 @@
         const items = S.cards.map(c => {
           const e = rosterEntryOf(c) || {}, nasc = e.nasc || '', age = ageAt(nasc, DATA_PROVA);
           const rede = e.rede || '', perm = e.perm || '', sc = cardScore(c);
-          return { c, sc, nasc, rede, perm, idoso: age != null && age >= 60, permPub: rede === 'Pública' && perm === 'Sim', aprov: sc * 2 >= NQ };
+          return { c, sc, nasc, rede, perm, raca: e.raca || '', genero: e.genero || '', idoso: age != null && age >= 60, permPub: rede === 'Pública' && perm === 'Sim', aprov: sc * 2 >= NQ };
         });
         const cmpCrit = (a, b) => {
           if (a.sc !== b.sc) return [b.sc - a.sc, 'nota'];
@@ -4215,13 +4221,13 @@
       /* Com a lista de inscritos: aba Resultados já ordenada, com CPF mascarado (item 6.5), data de nascimento,
          rede e quadro permanente. A nota é o número de acertos. */
       function buildRosterResultRows() {
-        const head = ['Lista', 'Posição', 'Nome', 'CPF mascarado', 'CPF', 'Nascimento', 'Rede', 'Quadro permanente',
+        const head = ['Lista', 'Posição', 'Nome', 'CPF mascarado', 'CPF', 'Nascimento', 'Rede', 'Quadro permanente', 'Raça/cor', 'Gênero',
           'Nota', 'Situação', 'Revisão', 'Desempate (em relação ao anterior)', 'Alertas', 'Lista de inscritos']
           .concat(Array.from({ length: NQ }, (_, i) => 'Q' + (i + 1)));
         const { order } = rankCards(ROSTER.vagas), rows = [head];
         const row = x => {
           const c = x.c;
-          return [LISTA_TXT[x.grp] || '', x.pos, c.name || '', maskCpf(c.cpf), c.cpf || '', fmtBirth(x.nasc), x.rede, x.perm,
+          return [LISTA_TXT[x.grp] || '', x.pos, c.name || '', maskCpf(c.cpf), c.cpf || '', fmtBirth(x.nasc), x.rede, x.perm, x.raca, x.genero,
             c.aus ? '' : Math.round(x.sc / NQ * S.cfg.max * 100) / 100,
             c.aus ? 'Ausente' : c.eli ? 'Eliminado' : 'Presente',
             c.rev ? 'Revisado' : (alertsOf(c).length ? 'Pendente' : 'Sem alertas'),
