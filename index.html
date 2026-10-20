@@ -2059,6 +2059,44 @@
         }
         return out;
       }
+      /* Campo cinza ao lado do E (uso exclusivo da comissão). Se o candidato pintar esse campo, inteiro ou só
+         em parte, a questão é anulada para ele (vale 0; questão anulada no gabarito continua dando o ponto).
+         O tom do campo varia com a impressão (claro em uns lotes, quase cinza-escuro em outros), então a referência
+         é o próprio cartão: pixel a pixel, o tom típico dos 30 campos cinza (60º percentil, robusto a alguns
+         campos marcados). Tinta é o que fica bem mais escuro que essa referência. */
+      const COMM_BIG = 30;
+      /* rgba: imagem canônica colorida. Usa a luminosidade pura (não inkGray): o campo cinza às vezes sai
+         levemente azulado na impressão, e a regra de caneta azul das respostas o confundiria com tinta.
+         A imagem é suavizada (3x3) antes da comparação: a retícula de pontos do cinza escuro some, traços ficam.
+         Decide pela maior mancha contínua de tinta (traço ou preenchimento), não por pontos espalhados. */
+      function readCommission(rgba, offs) {
+        const IX = 8, IY = 6, W = Math.round(BOX_W) - 2 * IX, Hh = Math.round(BOX_H) - 2 * IY, n = W * Hh, org = [];
+        for (let q = 0; q < NQ; q++) { const o = offs && offs[q] ? offs[q] : [0, 0], r = boxRect(q, 5, { dx: o[0], dy: o[1] }); org.push([Math.round(r.x + IX), Math.round(r.y + IY)]); }
+        const lum = (x, y) => { const i = (y * CW + x) * 4; return 0.299 * rgba[i] + 0.587 * rgba[i + 1] + 0.114 * rgba[i + 2]; };
+        const sm = org.map(([ox, oy]) => { const a = new Float32Array(n); for (let y = 0; y < Hh; y++) for (let x = 0; x < W; x++) { let s = 0; for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) s += lum(ox + x + dx, oy + y + dy); a[y * W + x] = s / 9; } return a; });
+        const ref = new Float32Array(n), vals = new Float32Array(NQ), rk = Math.floor(0.6 * (NQ - 1));
+        for (let i = 0; i < n; i++) { for (let q = 0; q < NQ; q++) vals[q] = sm[q][i]; vals.sort(); ref[i] = vals[rk]; }
+        const mark = [], ink = [], big = [], m = new Uint8Array(n), stk = new Int32Array(n);
+        for (let q = 0; q < NQ; q++) {
+          let cnt = 0;
+          for (let i = 0; i < n; i++) { const r = ref[i]; m[i] = sm[q][i] < r - Math.max(40, 0.3 * r) ? 1 : 0; cnt += m[i]; }
+          let best = 0;
+          for (let i = 0; i < n; i++) {
+            if (m[i] !== 1) continue;
+            let sp = 0, a = 0; stk[sp++] = i; m[i] = 2;
+            while (sp) {
+              const p = stk[--sp], px = p % W, py = (p / W) | 0; a++;
+              if (px > 0 && m[p - 1] === 1) { m[p - 1] = 2; stk[sp++] = p - 1; }
+              if (px < W - 1 && m[p + 1] === 1) { m[p + 1] = 2; stk[sp++] = p + 1; }
+              if (py > 0 && m[p - W] === 1) { m[p - W] = 2; stk[sp++] = p - W; }
+              if (py < Hh - 1 && m[p + W] === 1) { m[p + W] = 2; stk[sp++] = p + W; }
+            }
+            if (a > best) best = a;
+          }
+          ink.push(Math.round(cnt / n * 1000) / 1000); big.push(best); mark.push(best >= COMM_BIG);
+        }
+        return { mark, ink, big };
+      }
       function readFills(gray, found) {
         const fills = [], offs = [], thresholds = [], ltests = [], rowOff = [];
         // 1ª passada: alinhamento e limiar de cada linha
@@ -2323,11 +2361,12 @@
       }
       /* Questão anulada vale ponto para todos (inclusive branco e dupla marcação).
          Nas demais, dupla marcação zera a questão, mesmo contendo a alternativa correta. */
-      function score(ans, gab, status) {
+      function score(ans, gab, status, comm) {
         let s = 0;
         for (let q = 0; q < NQ; q++) {
           if (gab[q] === 5) { s++; continue; }
           if (ans[q] === -2 || (status && status[q] === 'double')) continue;
+          if (comm && comm[q]) continue;   // campo cinza da comissão marcado: questão anulada para o candidato
           if (ans[q] >= 0 && ans[q] === gab[q]) s++;
         }
         return s;
@@ -2877,7 +2916,7 @@
         STORE.error = ''; STORE.denied = false;   // só uma resposta de sucesso limpa o erro
         return (r.headers.get('content-type') || '').includes('json') ? r.json() : null;
       }
-      const LETRA = (c, q) => isDouble(c, q) ? 'DUPLA' : c.ans[q] >= 0 ? LET[c.ans[q]] : '';
+      const LETRA = (c, q) => (c.comm && c.comm[q]) ? 'CAMPO CINZA' : isDouble(c, q) ? 'DUPLA' : c.ans[q] >= 0 ? LET[c.ans[q]] : '';
       function cardPayload(c) {
         const estado = {}; for (const k in c) if (!(c[k] instanceof Blob)) estado[k] = c[k];   // tudo menos imagens
         const sc = cardScore(c);
@@ -3328,6 +3367,10 @@
           const rf = readFills(gray, found), cl = classify(rf.fills, thr(), rf.evidence), fl = readFlags(gray);
           if (S.openId !== c.id) return;
           c.fills = rf.fills; c.offs = rf.offs; c.evidence = rf.evidence; c.flagRead = fl; c.detectionVersion = 3;
+          const cm = readCommission(cd, rf.offs);
+          if (!c.comm) c.comm = new Array(NQ).fill(false); if (!c.commMan) c.commMan = new Array(NQ).fill(false);
+          for (let q = 0; q < NQ; q++) if (!c.commMan[q]) c.comm[q] = cm.mark[q];
+          c.commEv = { ink: cm.ink, big: cm.big };
           for (let q = 0; q < NQ; q++) if (!c.man[q]) { c.ans[q] = cl.ans[q]; c.st[q] = cl.st[q]; }
           const situation = flagDecision(fl, c.ans);
           for (const k of ['aus', 'eli']) if (!c.flagManual?.[k]) c[k] = situation[k];
@@ -3402,7 +3445,11 @@
 
       /* ================= regras do cartão ================= */
       const isDouble = (c, q) => c.ans[q] === -2 || c.st[q] === 'double';
-      const cardScore = c => score(c.ans, S.gab, c.st);
+      const isComm = (c, q) => !!(c.comm && c.comm[q]);
+      const cardScore = c => score(c.ans, S.gab, c.st, c.comm);
+      /* texto da questão nas planilhas */
+      const qCell = (c, q) => isComm(c, q) ? (S.gab[q] === 5 ? 'CAMPO CINZA (anulada: ponto)' : 'CAMPO CINZA (0)')
+        : isDouble(c, q) ? (S.gab[q] === 5 ? 'DUPLA (anulada: ponto)' : 'DUPLA (0)') : c.ans[q] >= 0 ? LET[c.ans[q]] : '';
       /* ================= Lista de inscritos (.xlsx/.csv com nome e CPF) =================
          O CPF é o campo mais confiável da leitura (tem dígito verificador). Cada cartão é cruzado com a lista:
          1) procura o CPF lido; se não houver igual, o mais próximo com até 1 dígito de diferença
@@ -3639,6 +3686,8 @@
         const d = c.ans.map((_, i) => isDouble(c, i) && S.gab[i] !== 5 ? i + 1 : 0).filter(Boolean);
         const w = c.st.map((s, i) => s === 'weak' ? i + 1 : 0).filter(Boolean);
         if (d.length) a.push('Dupla marcação — questão zerada: ' + d.map(n => 'Q' + n).join(', '));
+        const cz = c.ans.map((_, i) => isComm(c, i) && S.gab[i] !== 5 ? i + 1 : 0).filter(Boolean);
+        if (cz.length) a.push('Campo cinza da comissão marcado — questão anulada para o candidato: ' + cz.map(n => 'Q' + n).join(', '));
         if (w.length) a.push('Marcação fraca ou traço suspeito: ' + w.map(n => 'Q' + n).join(', '));
         if (!c.name) a.push('Sem nome');
         else if (c.nameSrc === 'ocr' && c.nameLow) a.push('Nome lido por OCR com dúvida: confira');
@@ -3707,6 +3756,7 @@
         th.getContext('2d').drawImage(cv, 0, 0, th.width, th.height);
         const thumb = await blobOf(th, 'image/jpeg', 0.7);
         const rf = readFills(r.gray, r.found), cl = classify(rf.fills, thr(), rf.evidence), fl = readFlags(r.gray), situation = flagDecision(fl, cl.ans);
+        const cm = readCommission(r.rgba, rf.offs);
         /* nome e CPF: camada de texto do PDF (se houver) e, senão, leitura por OCR */
         let name = meta.name || '', cpf = meta.cpf || '', nameSrc = name ? 'texto' : '', nameLow = false, cpfLow = false;
         let o = null, ocrEngine = 'texto', ocrNotice = '';
@@ -3729,7 +3779,8 @@
         }
         return {
           id: uid(), t: Date.now(), src: meta.src, file: meta.file || '', page: meta.page || 0,
-          name, cpf, nameSrc, nameLow, cpfLow, ocrCrop, ocrEngine, ocrNotice, ocrDetails: o, fills: rf.fills, offs: rf.offs, evidence: rf.evidence, flagRead: fl, detectionVersion: 3, ans: cl.ans, st: cl.st,
+          name, cpf, nameSrc, nameLow, cpfLow, ocrCrop, ocrEngine, ocrNotice, ocrDetails: o, fills: rf.fills, offs: rf.offs, evidence: rf.evidence, flagRead: fl, detectionVersion: 3, ans: cl.ans,
+          comm: cm.mark, commEv: { ink: cm.ink, big: cm.big }, commMan: new Array(NQ).fill(false), st: cl.st,
           man: new Array(NQ).fill(false), ...situation, flagManual: {}, rev: false, img, thumb, inl: r.inliers
         };
       }
@@ -3882,8 +3933,15 @@
         x.lineJoin = 'round'; x.lineCap = 'round';
         for (let q = 0; q < NQ; q++) {
           const off = { dx: c.offs ? c.offs[q][0] : 0, dy: c.offs ? c.offs[q][1] : 0 };
-          const a = c.ans[q], gk = S.gab[q], double = isDouble(c, q), ok = gk === 5 || (!double && a >= 0 && a === gk);
+          const comm = isComm(c, q), a = c.ans[q], gk = S.gab[q], double = isDouble(c, q) || comm, ok = gk === 5 || (!double && a >= 0 && a === gk);
           const gr = boxRect(q, 5, off), cx = gr.x + gr.w / 2, cy = gr.y + gr.h / 2;
+          if (comm) {   // campo cinza pintado: contorna o campo e a alternativa marcada, e zera
+            x.lineWidth = 4; x.strokeStyle = WARNC; x.strokeRect(gr.x - 2, gr.y - 2, gr.w + 4, gr.h + 4);
+            if (a >= 0) { const r = boxRect(q, a, off); x.strokeRect(r.x - 2, r.y - 2, r.w + 4, r.h + 4); }
+            x.textBaseline = 'middle'; x.textAlign = 'left'; x.font = '800 23px system-ui,sans-serif'; x.fillStyle = gk === 5 ? BLUE : WARNC;
+            x.fillText(gk === 5 ? 'anul.' : '0', gr.x + gr.w + 8, cy + 1);
+            continue;
+          }
           x.lineWidth = 4;
           if (a >= 0 && !double) { const r = boxRect(q, a, off); x.strokeStyle = ok ? OKC : BADC; x.strokeRect(r.x - 2, r.y - 2, r.w + 4, r.h + 4); }
           if (double) { x.strokeStyle = WARNC; for (let k = 0; k < 5; k++) if (markedAlternative(c, q, k)) { const r = boxRect(q, k, off); x.strokeRect(r.x - 2, r.y - 2, r.w + 4, r.h + 4); } }
@@ -4149,9 +4207,7 @@
             c.aus ? 'Ausente' : c.eli ? 'Eliminado' : 'Presente',
             c.rev ? 'Revisado' : (alertsOf(c).length ? 'Pendente' : 'Sem alertas'),
             alertsOf(c).join(' | '), ROSTER.list && c.roster ? ROSTER_TXT[c.roster.status] || '' : '']
-            .concat(c.ans.map((a, q) => isDouble(c, q)
-              ? (S.gab[q] === 5 ? 'DUPLA (anulada: ponto)' : 'DUPLA (0)')
-              : a >= 0 ? LET[a] : '')));
+            .concat(c.ans.map((a, q) => qCell(c, q))));
         }
         return rows;
       }
@@ -4232,7 +4288,7 @@
             c.aus ? 'Ausente' : c.eli ? 'Eliminado' : 'Presente',
             c.rev ? 'Revisado' : (alertsOf(c).length ? 'Pendente' : 'Sem alertas'),
             x.why || '', alertsOf(c).join(' | '), c.roster ? ROSTER_TXT[c.roster.status] || '' : '']
-            .concat(c.ans.map((a, q) => isDouble(c, q) ? (S.gab[q] === 5 ? 'DUPLA (anulada: ponto)' : 'DUPLA (0)') : a >= 0 ? LET[a] : ''));
+            .concat(c.ans.map((a, q) => qCell(c, q)));
         };
         for (const x of order) rows.push(row(x));
         return rows;
@@ -4442,7 +4498,7 @@
         const rows = Array.from({ length: NQ }, (_, q) => ({ q: q + 1, counts: [0, 0, 0, 0, 0], valid: 0 }));
         for (const c of S.cards) for (let q = 0; q < NQ; q++) {
           const a = c.ans?.[q];
-          if (!Number.isInteger(a) || a < 0 || a > 4 || isDouble(c, q)) continue;
+          if (!Number.isInteger(a) || a < 0 || a > 4 || isDouble(c, q) || isComm(c, q)) continue;
           rows[q].counts[a]++;
           rows[q].valid++;
         }
@@ -4617,16 +4673,17 @@
 
       /* ---------- revisão ---------- */
       function rowHtml(c, q) {
-        const st = c.st[q], a = c.ans[q], g = S.gab[q], double = isDouble(c, q), fl = double || st === 'weak';
-        const lab = double ? (g === 5 ? 'dupla marcação — questão anulada (ponto concedido)' : 'dupla marcação — zerada (0)') : st === 'weak' ? 'marcação fraca / traço suspeito' : st === 'blank' ? 'em branco' : (c.man[q] ? 'ajustada' : '');
+        const st = c.st[q], a = c.ans[q], g = S.gab[q], double = isDouble(c, q), comm = isComm(c, q), fl = double || st === 'weak' || comm || !!(c.commMan && c.commMan[q]);
+        const lab = comm ? (g === 5 ? 'campo cinza da comissão marcado — questão anulada no gabarito (ponto concedido)' : 'campo cinza da comissão marcado — anulada para o candidato (0)') : double ? (g === 5 ? 'dupla marcação — questão anulada (ponto concedido)' : 'dupla marcação — zerada (0)') : st === 'weak' ? 'marcação fraca / traço suspeito' : st === 'blank' ? 'em branco' : (c.man[q] ? 'ajustada' : '');
         const chips = [0, 1, 2, 3, 4].map(k => {
           let cl = 'chip';
           if (double) { if (markedAlternative(c, q, k)) cl += ' dbl'; }
           else if (a === k) cl += (g === 5 || g === k) ? ' ok' : ' bad';
           else if (g === k && a !== k) cl += ' key';
           return `<button class="${cl}" data-set="${q},${k}" aria-label="Questão ${q + 1} alternativa ${LET[k]}">${LET[k]}</button>`;
-        }).join('');
-        const off = c.offs ? c.offs[q] : [0, 0], t = TPL[q], cropX = t.x - 12 + off[0], cropW = 470, cropY = t.y - 8 + off[1], cropH = 41;
+        }).join('') + ((comm || (c.commMan && c.commMan[q]))
+          ? `<button class="chip${comm ? ' dbl' : ''}" data-comm="${q}" title="Campo cinza da comissão: clique para ${comm ? 'desconsiderar' : 'considerar'} a marca" aria-label="Questão ${q + 1}: campo cinza ${comm ? 'marcado' : 'desconsiderado'}">cinza</button>` : '');
+        const off = c.offs ? c.offs[q] : [0, 0], t = TPL[q], cropX = t.x - 12 + off[0], cropW = 530, cropY = t.y - 8 + off[1], cropH = 41;
         const px = Math.max(0, Math.min(1, cropX / (CW - cropW))) * 100, py = Math.max(0, Math.min(1, cropY / (CH - cropH))) * 100;
         const crop = fl ? `<div class="crop question-crop" style="aspect-ratio:${cropW}/${cropH};background-image:url(${urlOf(c, 'img')});background-size:${CW / cropW * 100}% auto;background-position:${px}% ${py}%"></div>` : '';
         return `<div class="qrow ${fl ? 'fl' : ''}" id="q${q}">${crop}<div class="qr" style="border:0;padding:0"><span class="qn">${q + 1}</span>${chips}<span class="lab ${fl ? '' : 'mut'}">${lab}</span></div></div>`;
@@ -4717,7 +4774,13 @@
       }
       function applyOnly() {
         const c = S.cards.find(x => x.id === S.openId); if (!c) return;
-        for (let q = 0; q < NQ; q++) { const r = $('#q' + q); if (r) r.style.display = (S.onlyAlerts && !(isDouble(c, q) || c.st[q] === 'weak')) ? 'none' : ''; }
+        for (let q = 0; q < NQ; q++) { const r = $('#q' + q); if (r) r.style.display = (S.onlyAlerts && !(isDouble(c, q) || c.st[q] === 'weak' || isComm(c, q))) ? 'none' : ''; }
+      }
+      function toggleComm(c, q) {
+        if (!c.comm) c.comm = new Array(NQ).fill(false); if (!c.commMan) c.commMan = new Array(NQ).fill(false);
+        c.comm[q] = !c.comm[q]; c.commMan[q] = true; saveSoon(c);
+        const old = $('#q' + q); const tmp = document.createElement('div'); tmp.innerHTML = rowHtml(c, q); old.replaceWith(tmp.firstElementChild);
+        applyOnly(); refreshMeta(c); pvSoon(c);
       }
       function setAns(c, q, k) {
         if (c.ans[q] === k) { c.ans[q] = -1; c.st[q] = 'blank'; } else { c.ans[q] = k; c.st[q] = 'ok'; }
@@ -4896,6 +4959,7 @@
         if (t.dataset.filter) { S.filter = t.dataset.filter; return renderList(); }
         if (t.dataset.sh) return sheetAction(t.dataset.sh);
         if (t.dataset.set) { const [q, k] = t.dataset.set.split(',').map(Number), c = S.cards.find(x => x.id === S.openId); if (c) setAns(c, q, k); return; }
+        if (t.dataset.comm != null) { const q = Number(t.dataset.comm), c = S.cards.find(x => x.id === S.openId); if (c) toggleComm(c, q); return; }
         if (t.dataset.g) {
           const [q, k] = t.dataset.g.split(',').map(Number); S.gab[q] = k; S.gabFrom = 'editado manualmente'; saveKV('gab', { g: S.gab, from: S.gabFrom }); renderGab(); return;
         }
