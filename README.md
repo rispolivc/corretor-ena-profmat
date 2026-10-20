@@ -1,4 +1,4 @@
-# Corretor de cartões-resposta — ENA/PROFMAT 2027
+# Corretor de cartões-resposta — ENA/SNAD - PROFMAT 2027
 
 App web, em um único `index.html`, que corrige os cartões-resposta do ENA a partir de PDFs digitalizados e gera as planilhas de notas e de classificação conforme o edital nº 23/2026.
 
