@@ -2097,8 +2097,26 @@
         }
         return { mark, ink, big };
       }
+      /* Marcação clara (caneta fraca, tinta quase cinza, scan claro). O limiar normal é 62% do papel da linha
+         (~155): uma marcação em cinza-claro (~170-190) fica quase toda acima dele e some. Aqui o app mede, no
+         próprio cartão, o tom das marcações: em cada linha, a alternativa mais escura, quando é bem mais escura
+         que o papel. Se esse tom típico estiver perto do limiar normal, o limiar do cartão passa para o meio do
+         caminho entre a marcação e o papel. Cartões com marcação escura (o caso normal) ficam como estavam. */
+      function lightInkThresholds(gray, rowOff, thresholds, papers) {
+        const med = r => { const v = []; for (let y = Math.round(r.y + 6); y < Math.round(r.y + r.h - 6); y++) for (let x = Math.round(r.x + 8); x < Math.round(r.x + r.w - 8); x += 2) v.push(gray[y * CW + x]); v.sort((a, b) => a - b); return v[v.length >> 1]; };
+        const lv = [];
+        for (let q = 0; q < NQ; q++) {
+          let d = 255; for (let k = 0; k < 5; k++) d = Math.min(d, med(boxRect(q, k, rowOff[q])));
+          if (d < papers[q] - 45) lv.push(d);
+        }
+        if (lv.length < 5) return thresholds;
+        lv.sort((a, b) => a - b);
+        const ink = lv[Math.floor(0.75 * (lv.length - 1))], Tm = thresholds.slice().sort((a, b) => a - b)[NQ >> 1];
+        if (ink < 0.9 * Tm) return thresholds;
+        return thresholds.map((T, q) => Math.max(T, Math.min(papers[q] - 30, (ink + papers[q]) / 2)));
+      }
       function readFills(gray, found) {
-        const fills = [], offs = [], thresholds = [], ltests = [], rowOff = [];
+        const fills = [], offs = [], thresholds = [], ltests = [], rowOff = [], papers = [];
         // 1ª passada: alinhamento e limiar de cada linha
         for (let q = 0; q < NQ; q++) {
           const t = TPL[q]; let dx = 0, dy = 0;
@@ -2111,15 +2129,16 @@
           for (let y = Math.round(rA.y); y < Math.round(rA.y + rA.h); y++)
             for (let x = Math.round(rA.x); x < Math.round(rE.x + rE.w); x++) { hist[gray[y * CW + x]]++; cnt++; }
           let acc = 0, P = 255; for (let i = 255; i >= 0; i--) { acc += hist[i]; if (acc >= cnt * 0.15) { P = i; break; } }
-          thresholds.push(Math.max(60, P * 0.62));
+          thresholds.push(Math.max(60, P * 0.62)); papers.push(P);
         }
+        const markT = lightInkThresholds(gray, rowOff, thresholds, papers);
         // encaixe fino de cada balão (fotos e digitalizações de baixa resolução deslocam os balões alguns pixels)
         const bsh = refineBoxes(gray, rowOff, thresholds);
         // letras impressas aprendidas no próprio cartão (modelos com letra dentro do balão)
         const learned = CARD.glyphs ? learnLetters(gray, rowOff, thresholds, bsh) : null;
         // 2ª passada: preenchimento sem a letra
         for (let q = 0; q < NQ; q++) {
-          const off = rowOff[q], T = thresholds[q], row = [], lrow = []; ltests.push(lrow);
+          const off = rowOff[q], T = markT[q], row = [], lrow = []; ltests.push(lrow);
           for (let k = 0; k < 5; k++) {
             const r = shiftRect(boxRect(q, k, off), bsh[q][k]), isLetter = (learned && learned.test(q, k, r, T)) || letterTest(gray, r, k, T); lrow.push(isLetter);
             const xa = Math.round(r.x + 6), xb = Math.round(r.x + r.w - 6), ya = Math.round(r.y + 5), yb = Math.round(r.y + r.h - 5);
@@ -2129,7 +2148,7 @@
           }
           fills.push(row.map(v => Math.round(v * 1000) / 1000));
         }
-        return { fills, offs, evidence: strokeEvidence(gray, fills, offs, thresholds, ltests, bsh) };
+        return { fills, offs, evidence: strokeEvidence(gray, fills, offs, markT, ltests, bsh), lightInk: markT !== thresholds };
       }
       /* Aprende, em cada cartão, como a letra de cada alternativa aparece impressa (posição, tamanho,
          espessura). Em cada coluna (A, B, …) de cada metade do cartão, a maioria dos 15 balões está vazia:
@@ -2514,6 +2533,14 @@
           strip: { name: [52, 212, 600, 52], cpf: [860, 212, 300, 52] }, total: { x: 920, y: 1586 }
         }
       };
+      /* SNAD 2027 (Profmat-D): mesma grade do ENA 2027; o cabeçalho tem duas linhas (Curso e Local de Prova),
+         então a faixa de nome/CPF, as caixas Ausente/Eliminado e o total ficam mais abaixo. */
+      CARD_MODELS.snad2027 = {
+        ...CARD_MODELS['2027'], label: 'SNAD 2027 — Profmat-D',
+        flag: { aus: { x: 51, y: 366, w: 87, h: 52 }, eli: { x: 1068, y: 366, w: 87, h: 52 } },
+        hdr: { x0: 50, y0: 296, x1: 1158, y1: 356 },
+        strip: { name: [52, 305, 600, 41], cpf: [860, 305, 300, 41] }, total: { x: 920, y: 1607 }
+      };
       let CARD = CARD_MODELS['2027'];
       function applyCardModel(id) {
         const m = CARD = CARD_MODELS[id] || CARD_MODELS['2027'];
@@ -2869,6 +2896,19 @@
          gabarito.json (obrigatório) e config.json (opcional) ficam na mesma pasta do index.html
          e são mantidos pelo administrador. Ver ESPECIFICACAO_API.md. */
       const CONFIG_URL = 'config.json', GABARITO_URL = 'gabarito.json';
+      /* Tipo de exame, escolhido pelo campo "exame" do config.json ("ENA" ou "SNAD").
+         Cada tipo tem o seu modelo de cartão, a sua base de dados no navegador (os cartões do ENA e do SNAD
+         nunca se misturam, mesmo publicados no mesmo site), a data da prova (só para a regra dos 60 anos),
+         a tabela de vagas e os itens do edital citados nas planilhas. */
+      const EXAMS = {
+        ENA: { kind: 'ENA', name: 'ENA 2027', model: '2027', db: 'corretor-cartoes', dataProva: '2026-10-10', edital: 'edital nº 23/2026',
+          it: { mask: '6.5', crit: '7.1.1', c1: '7.1.1.1', c2: '7.1.1.2', c3: null, cIdade: '7.1.1.3' } },
+        SNAD: { kind: 'SNAD', name: 'SNAD 2027', model: 'snad2027', db: 'corretor-cartoes-snad', dataProva: '2026-10-31', edital: 'edital nº 24/2026',
+          it: { mask: '7.5', crit: '4.2.1', c1: '4.2.1.a', c2: '4.2.1.b', c3: '4.2.1.c', cIdade: '4.2.1.d' } }
+      };
+      let EXAM = EXAMS.ENA;
+      const examKindOf = c => /SNAD|DOUTORADO/.test(String(c?.exame || c?.prova || '').toUpperCase()) ? 'SNAD' : 'ENA';
+      const isSnad = () => EXAM.kind === 'SNAD';
       const RIGOR = { rigido: 'rig', normal: 'nor', sensivel: 'sen' };
       const STORE = { mode: 'local', api: '', token: '', credentials: 'same-origin', busy: false, error: '', timer: null };
       const apiOn = () => STORE.mode === 'api' && !!STORE.api;
@@ -2921,7 +2961,7 @@
         const estado = {}; for (const k in c) if (!(c[k] instanceof Blob)) estado[k] = c[k];   // tudo menos imagens
         const sc = cardScore(c);
         return {
-          id: c.id, lote: c.lote || '', arquivo: c.file || '', pagina: c.page || 0,
+          id: c.id, exame: EXAM.kind, lote: c.lote || '', arquivo: c.file || '', pagina: c.page || 0,
           nome: c.name || '', cpf: c.cpf || '', ausente: !!c.aus, eliminado: !!c.eli,
           acertos: c.aus ? null : sc, nota: c.aus ? null : Math.round(sc / NQ * S.cfg.max * 100) / 100,
           respostas: Array.from({ length: NQ }, (_, q) => LETRA(c, q)), revisado: !!c.rev, alertas: alertsOf(c),
@@ -2991,7 +3031,7 @@
         open() {
           return new Promise((res, rej) => {
             if (!window.indexedDB) return rej(new Error('sem IndexedDB'));
-            const r = indexedDB.open('corretor-cartoes', 1);
+            const r = indexedDB.open(EXAM.db, 1);
             r.onupgradeneeded = () => { const d = r.result; d.createObjectStore('cards', { keyPath: 'id' }); d.createObjectStore('kv', { keyPath: 'k' }); };
             r.onsuccess = () => { this.db = r.result; res(); };
             r.onerror = () => rej(r.error);
@@ -3529,10 +3569,30 @@
         perm: 'permanente_rede_publica', priv: 'professor_rede_privada', sigla: 'sigla_instituicao', cidade: 'cidade_instituicao', uf: 'cidade_uf',
         raca: 'raca_cor', genero: 'genero' };
       const scaCol = (header, key) => (header || []).findIndex(v => String(v == null ? '' : v).trim().toLowerCase() === SCA_COLS[key]);
+      /* tempo de docência em Matemática na rede pública, em anos. Aceita número (anos; meses ou dias se o
+         cabeçalho disser), texto como "12 anos e 3 meses", ou a data de início do exercício. */
+      const TEMPO_HDR = /TEMPO.*(DOCENC|EXERCICIO|MAGISTERIO|SERVICO)|(ANOS|MESES).*(DOCENC|EXERCICIO|MAGISTERIO)|(INICIO|ADMISSAO|INGRESSO).*(DOCENC|EXERCICIO|MAGISTERIO|REDE PUBLICA)/;
+      function parseTempo(v, hdr) {
+        if (v == null || v === '') return null;
+        const h = _hdr(hdr || ''), isStart = /INICIO|ADMISSAO|INGRESSO|DATA/.test(h);
+        const fromDate = iso => { if (!iso) return null; const [y, m, d] = iso.split('-').map(Number), [Y, M, D] = EXAM.dataProva.split('-').map(Number); const t = (Y - y) + (M - m) / 12 + (D - d) / 365.25; return t >= 0 ? t : null; };
+        if (typeof v === 'number') {
+          if (isStart) return fromDate(parseBirth(v));
+          return /MES/.test(h) ? v / 12 : /DIA/.test(h) ? v / 365.25 : v;
+        }
+        const t = _hdr(v);
+        if (/^\d{1,2}[-\/.]\d{1,2}[-\/.]\d{2,4}|^\d{4}-\d{1,2}-\d{1,2}/.test(String(v).trim())) return fromDate(parseBirth(v));
+        const a = t.match(/(\d+(?:[.,]\d+)?)\s*ANO/), m = t.match(/(\d+)\s*MES/);
+        if (a || m) return (a ? parseFloat(a[1].replace(',', '.')) : 0) + (m ? +m[1] / 12 : 0);
+        const n = t.match(/^(\d+(?:[.,]\d+)?)$/); if (n) { const x = parseFloat(n[1].replace(',', '.')); return /MES/.test(h) ? x / 12 : /DIA/.test(h) ? x / 365.25 : x; }
+        return null;
+      }
       function rosterExtraCols(rows, hr, cc, nc) {
-        const out = { nasc: -1, rede: -1, redePub: -1, redePriv: -1, perm: -1, permPub: false, sca: false, raca: -1, genero: -1 };
+        const out = { nasc: -1, rede: -1, redePub: -1, redePriv: -1, perm: -1, permPub: false, sca: false, raca: -1, genero: -1, tempo: -1, tempoHdr: '' };
         if (hr < 0) return out;
         const H = rows[hr] || [];
+        // tempo de docência na rede pública (desempate do SNAD): pelo nome do cabeçalho
+        { const k = H.findIndex((v, i) => i !== cc && i !== nc && TEMPO_HDR.test(_hdr(v)) && !/PRIVAD/.test(_hdr(v))); if (k >= 0) { out.tempo = k; out.tempoHdr = String(H[k]); } }
         // planilha do SCA: colunas pelo nome exato
         if (scaCol(H, 'pub') >= 0 || scaCol(H, 'priv') >= 0) {
           out.sca = true;
@@ -3609,6 +3669,7 @@
               const e = { nome, cpf, row: i };
               if (ext.nasc >= 0) e.nasc = parseBirth(rows[i][ext.nasc]);
               if (ext.raca >= 0) e.raca = String(rows[i][ext.raca] ?? '').trim();
+              if (ext.tempo >= 0) { const t = parseTempo(rows[i][ext.tempo], ext.tempoHdr); e.tempo = t == null ? null : Math.round(t * 100) / 100; }
               if (ext.genero >= 0) e.genero = String(rows[i][ext.genero] ?? '').trim();
               // perguntas "professor da rede pública?" / "professor da rede privada?" (SCA) mandam; uma coluna
               // genérica de rede só é usada se elas não existirem ou não responderem
@@ -3729,10 +3790,27 @@
         }
         return { g, w: aw, h: ah, k };
       }
+      /* Correção da cor do papel. Alguns scanners entregam a página inteira levemente azulada (papel
+         ~240,244,255). Isso enganava a regra de caneta azul: o próprio papel virava "tinta" e todas as
+         alternativas pareciam marcadas. Aqui a cor do papel é medida na própria página (percentil 90 de cada
+         canal) e cada canal é escalado para o papel ficar neutro, sem mudar o brilho (o canal mais claro
+         fica como está). Scans de papel neutro (diferença entre canais de até 4 níveis) não são alterados. */
+      function neutralizePaper(data) {
+        const H = [new Uint32Array(256), new Uint32Array(256), new Uint32Array(256)];
+        let n = 0;
+        for (let i = 0; i < data.length; i += 4 * 7) { H[0][data[i]]++; H[1][data[i + 1]]++; H[2][data[i + 2]]++; n++; }
+        const pct = h => { let a = 0; for (let v = 255; v >= 0; v--) { a += h[v]; if (a >= n * 0.10) return v; } return 255; };
+        const p = H.map(pct), top = Math.max(...p);
+        if (top - Math.min(...p) <= 4 || Math.min(...p) < 150) return null;
+        const lut = p.map(c => { const g = top / c, t = new Uint8ClampedArray(256); for (let v = 0; v < 256; v++) t[v] = Math.round(v * g); return t; });
+        for (let i = 0; i < data.length; i += 4) { data[i] = lut[0][data[i]]; data[i + 1] = lut[1][data[i + 1]]; data[i + 2] = lut[2][data[i + 2]]; }
+        return p;
+      }
       /* mode: 'scan' (página inteira) | 'photo' (foto de câmera) ; hint: candidato pronto */
       async function scanCanvas(cv, mode, hint) {
         const w = cv.width, h = cv.height;
         const data = cv.getContext('2d', { willReadFrequently: true }).getImageData(0, 0, w, h).data;
+        neutralizePaper(data);
         let r, diag = [], weakBest = null;
         const keep = x => { if (x && x.weak && (!weakBest || x.weak.resid < weakBest.resid)) weakBest = x.weak; return x; };
         if (hint) { r = keep(processSource(data, w, h, [hint])); if (r.ok) return r; }
@@ -4117,7 +4195,7 @@
           if (p.num === hdrNum) {
             if (taken(p)) throw new Error('As colunas de nota e lista já possuem conteúdo.');
             const st = p.inside.match(/<c\b[^>]*\bs="(\d+)"/); headerStyle = st ? ' s="' + st[1] + '"' : '';
-            add.push(`<c r="${noteLab}${p.num}"${headerStyle} t="inlineStr"><is><t>Nota</t></is></c>`, `<c r="${ordLab}${p.num}"${headerStyle} t="inlineStr"><is><t>Lista</t></is></c>`, `<c r="${posLab}${p.num}"${headerStyle} t="inlineStr"><is><t>Posição</t></is></c>`);
+            add.push(`<c r="${noteLab}${p.num}"${headerStyle} t="inlineStr"><is><t>Nota</t></is></c>`, `<c r="${ordLab}${p.num}"${headerStyle} t="inlineStr"><is><t>${xmlSafe(grpHead())}</t></is></c>`, `<c r="${posLab}${p.num}"${headerStyle} t="inlineStr"><is><t>Posição</t></is></c>`);
           } else {
             if (notes.has(p.num)) {
               const note = notes.get(p.num); if (!Number.isFinite(note)) throw new Error('Foi encontrada uma nota inválida.');
@@ -4167,10 +4245,13 @@
       }
       const VAGAS_ANEXO2 = [["CEFET","Belo Horizonte","MG",20],["CPII","Rio de Janeiro","RJ",25],["UNIR","Ji-Parana","RO",10],["UNIR","Porto Velho","RO",15],["UFABC","Santo André","SP",30],["IFSP","São Paulo","SP",30],["IFPI","Floriano","PI",30],["IFRS","Canoas","RS",15],["PUC-Rio","Rio de Janeiro","RJ",20],["UnB","Brasília","DF",35],["USP","São Paulo","SP",20],["UNEMAT","Barra do Bugres","MT",15],["UNEMAT","Sinop","MT",15],["UDESC","Joinville","SC",14],["UEA","Manaus","AM",20],["UERJ","Rio de Janeiro","RJ",36],["UERJ","São Gonçalo","RJ",20],["UEPB","Campina Grande","PB",22],["UNICAMP","Campinas","SP",18],["UEFS","Feira de Santana","BA",18],["UEL","Londrina","PR",8],["UEM","Maringá","PR",20],["UEMS","Dourados","MS",12],["UEPG","Ponta Grossa","PR",13],["UESC","Ilhéus","BA",18],["UECE","Fortaleza","CE",15],["UECE","Quixadá","CE",15],["UEMA","Balsas","MA",16],["UEMA","São Luís","MA",24],["UNIOESTE","Cascavel","PR",15],["UESPI","Teresina","PI",20],["UESB","Vitória da Conquista","BA",25],["UVA","Sobral","CE",11],["UNESP","Bauru","SP",10],["UNESP","Rio Claro","SP",10],["UNESP","São José do Rio Preto","SP",7],["UFBA","Salvador","BA",20],["UFFS","Chapecó","SC",18],["UFGD","Dourados","MS",10],["UFPB","João Pessoa","PB",15],["UFAL","Arapiraca","AL",20],["UFAL","Maceió","AL",30],["UNIFAL","Alfenas","MG",15],["UFCG","Campina Grande","PB",20],["UFCAT","Catalão","GO",16],["UFG","Goiânia","GO",30],["UFJ","Jataí","GO",13],["UFJF","Juiz de Fora","MG",15],["UFLA","Lavras","MG",13],["UFMT","Barra do Garças","MT",10],["UFMT","Cuiabá","MT",25],["UFMS","Campo Grande","MS",15],["UFMS","Três Lagoas","MS",18],["UFOP","Ouro Preto","MG",12],["UFPE","Caruaru","PE",10],["UFR","Rondonópolis","MT",9],["UFRR","Boa Vista","RR",15],["UFSC","Blumenau","SC",20],["UFSC","Florianópolis","SC",15],["UFSM","Santa Maria","RS",10],["UFSCAR","São Carlos","SP",10],["UFSJ","Ouro Branco","MG",15],["UFSJ","São João del Rei","MG",10],["UNIFESP","Diadema","SP",12],["UNIFESP","São José dos Campos","SP",20],["FUFS","Aracaju","SE",20],["FUFS","Itabaiana","SE",10],["UFU","Uberlândia","MG",18],["UFV","Florestal","MG",20],["UFAC","Rio Branco","AC",15],["UNIFAP","Macapá","AP",13],["UFCA","Juazeiro do Norte","CE",20],["UFC","Fortaleza","CE",10],["UFDPar","Parnaíba","PI",10],["UFES","Vitória","ES",25],["UNIRIO","Rio de Janeiro","RJ",20],["UFMA","São Luis","MA",22],["UFNT","Araguaina","TO",10],["UFOB","Barreiras","BA",18],["UFOPA","Santarém","PA",13],["UNIPAMPA","Caçapava do Sul","RS",7],["UFPA","Abaetetuba","PA",20],["UFPA","Belém","PA",22],["UFPA","Bragança","PA",15],["UFPA","Cametá","PA",14],["UFPA","Castanhal","PA",15],["UFPR","Curitiba","PR",10],["UFPI","Teresina","PI",28],["UFRB","Cruz das Almas","BA",16],["UFRJ","Rio de Janeiro","RJ",20],["FURG","Rio Grande","RS",8],["UFRN","Natal","RN",15],["UFT","Arraias","TO",20],["UFTM","Uberaba","MG",16],["UNIVASF","Juazeiro","BA",20],["UFVJM","Teófilo Otoni","MG",15],["UFF","Niterói","RJ",20],["UFRPE","Recife","PE",30],["UFRRJ","Seropédica","RJ",20],["UFERSA","Mossoró","RN",30],["URCA","Juazeiro do Norte","CE",10],["UTFPR","Cornélio Procópio","PR",20],["UTFPR","Curitiba","PR",30],["UTFPR","Pato Branco","PR",10],["UTFPR","Toledo","PR",12],["UNILAB","Redenção","CE",15],["UENF","Campos dos Goytacazes","RJ",18]];
       /* vagas da instituição/campus no Anexo 2 do edital (sigla + cidade da lista do SCA) */
+      /* Anexo 2 do edital nº 24/2026 (SNAD 2027): 100 vagas */
+      const VAGAS_SNAD = [['UnB', 'Brasília', 'DF', 20], ['UEM', 'Maringá', 'PR', 10], ['UEPB', 'Campina Grande', 'PB', 10],
+        ['UERJ', 'Rio de Janeiro', 'RJ', 20], ['UFMS', 'Campo Grande', 'MS', 20], ['UFPA', 'Belém', 'PA', 20]];
       function vagasAnexo2(inst) {
         if (!inst || !inst.sigla) return null;
         const n = v => String(v || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toUpperCase().replace(/[^A-Z0-9]/g, '');
-        const rows = VAGAS_ANEXO2.filter(r => n(r[0]) === n(inst.sigla));
+        const rows = (isSnad() ? VAGAS_SNAD : VAGAS_ANEXO2).filter(r => n(r[0]) === n(inst.sigla));
         if (rows.length === 1) return { vagas: rows[0][3], campus: rows[0][0] + ' – ' + rows[0][1] };
         const r = rows.find(r => n(r[1]) === n(inst.cidade)) || (inst.uf ? null : null);
         return r ? { vagas: r[3], campus: r[0] + ' – ' + r[1] } : null;
@@ -4178,11 +4259,14 @@
       /* pergunta o número de vagas (pré-preenchido pelo Anexo 2); null se cancelar */
       function askVagas() {
         const a2 = vagasAnexo2(ROSTER.inst), def = Number.isInteger(ROSTER.vagas) ? ROSTER.vagas : a2 ? a2.vagas : '';
-        const origem = a2 ? `No Anexo 2 do edital, ${esc(a2.campus)} tem <b>${a2.vagas}</b> vagas.` : 'Não encontrei esta instituição no Anexo 2 do edital.';
+        const origem = a2 ? `No Anexo 2 do ${EXAM.edital}, ${esc(a2.campus)} tem <b>${a2.vagas}</b> vagas.` : `Não encontrei esta instituição no Anexo 2 do ${EXAM.edital}.`;
+        const titulo = isSnad() ? 'Vagas da instituição' : 'Vagas para a Lista 1';
+        const explica = isSnad() ? 'Ele define o limite da Etapa 2: os habilitados mais bem classificados, até 5 vezes o número de vagas, incluídos os empates (item 4.1.2).'
+          : 'Ele separa, entre os aprovados da rede pública, os classificados (Lista 1) dos demais (Lista 2).';
         return new Promise(res => {
           const d = $('#dlg'); d.hidden = false;
-          d.innerHTML = `<div class="busybox"><p style="margin:0 0 10px"><b>Vagas para a Lista 1</b><br>${origem} Confirme o número de vagas
-            (ou o número atualizado pela CAN). Ele separa, entre os aprovados da rede pública, os classificados (Lista 1) dos demais (Lista 2).</p>
+          d.innerHTML = `<div class="busybox"><p style="margin:0 0 10px"><b>${titulo}</b><br>${origem} Confirme o número de vagas
+            (ou o número atualizado pela CAN). ${explica}</p>
             <input id="vagasIn" class="txt" type="number" min="0" step="1" value="${def}" style="max-width:140px;margin:0 0 14px">
             <div class="row" style="justify-content:flex-end"><button class="btn" data-r="0">Cancelar</button><button class="btn pri" data-r="1">Exportar</button></div></div>`;
           const inp = $('#vagasIn'); setTimeout(() => inp && inp.focus(), 0);
@@ -4194,7 +4278,6 @@
           };
         });
       }
-      const DATA_PROVA = '2026-10-10';   // ENA 2027 (edital nº 23/2026): só define quem tem 60 anos ou mais (item 7.1.1.1)
       function buildResultRows() {
         if (ROSTER.list) return buildRosterResultRows();
         const head = ['Nome', 'CPF', 'Acertos', 'Nota', 'Situação', 'Revisão', 'Alertas', 'Lista de inscritos']
@@ -4218,7 +4301,8 @@
            2) professor do quadro permanente da rede pública;
            3) idade mais elevada.
          Ausentes e eliminados vão ao final, sem ordem de classificação. */
-      const RESULT_COL_WIDTHS = [36, 8, 38, 16, 16, 12, 9, 11, 14, 20, 9, 11, 12, 34, 42, 26];
+      const RESULT_COL_WIDTHS_BASE = [36, 8, 38, 16, 16, 12, 9, 11, 14, 20, 9, 11, 12, 34, 42, 26];
+      const resultColWidths = () => isSnad() ? RESULT_COL_WIDTHS_BASE.slice(0, 8).concat([14], RESULT_COL_WIDTHS_BASE.slice(8)) : RESULT_COL_WIDTHS_BASE;
       function rosterEntryOf(c) {
         const d = cpfDigits(c.cpf);
         return (d && ROSTER.byCpf.get(d)) || (c.roster && c.roster.cpf && ROSTER.byCpf.get(c.roster.cpf)) || null;
@@ -4237,27 +4321,40 @@
          Cotas de cada instituição (item 7.1.3) não entram aqui. */
       const LISTA_TXT = { L1: 'Lista 1 – Rede pública (classificado)', L2: 'Lista 2 – Rede pública (aprovado)', L3: 'Lista 3 – Rede privada (aprovado)',
         SR: 'Aprovado sem rede informada (conferir)', RP: 'Reprovado (menos de 50%)', EL: 'Eliminado', AU: 'Ausente' };
+      /* SNAD 2027, Etapa 1 (itens 4.1.1, 4.1.2 e 7.4): quem não alcança 50% é eliminado; seguem para a Etapa 2
+         os habilitados até 5 vezes o número de vagas da instituição, incluídos os empates na nota de corte. */
+      const ETAPA_TXT = { E2: 'Classificado para a Etapa 2', HB: 'Habilitado (fora do limite da Etapa 2)',
+        RP: 'Eliminado na Etapa 1 (menos de 50%)', EL: 'Eliminado', AU: 'Ausente (eliminado)' };
+      const grpTxt = g => (isSnad() ? ETAPA_TXT : LISTA_TXT)[g] || '';
+      const grpHead = () => isSnad() ? 'Resultado da Etapa 1' : 'Lista';
       function rankCards(vagas) {
+        const it = EXAM.it;
         const items = S.cards.map(c => {
-          const e = rosterEntryOf(c) || {}, nasc = e.nasc || '', age = ageAt(nasc, DATA_PROVA);
+          const e = rosterEntryOf(c) || {}, nasc = e.nasc || '', age = ageAt(nasc, EXAM.dataProva);   // data da prova: só para a regra dos 60 anos
           const rede = e.rede || '', perm = e.perm || '', sc = cardScore(c);
-          return { c, sc, nasc, rede, perm, raca: e.raca || '', genero: e.genero || '', idoso: age != null && age >= 60, permPub: rede === 'Pública' && perm === 'Sim', aprov: sc * 2 >= NQ };
+          // tempo na rede pública: quem é só da rede privada tem zero
+          const tempo = e.tempo != null ? e.tempo : rede === 'Privada' ? 0 : null;
+          return { c, sc, nasc, rede, perm, tempo, raca: e.raca || '', genero: e.genero || '', idoso: age != null && age >= 60, permPub: rede === 'Pública' && perm === 'Sim', aprov: sc * 2 >= NQ };
         });
+        // critérios de desempate, sucessivamente (ENA: item 7.1.1; SNAD: item 4.2.1); devolve [sinal, critério que decidiu]
         const cmpCrit = (a, b) => {
           if (a.sc !== b.sc) return [b.sc - a.sc, 'nota'];
-          if (a.idoso !== b.idoso) return [a.idoso ? -1 : 1, '1º critério: 60 anos ou mais (item 7.1.1.1)'];
-          if (a.idoso && b.idoso && a.nasc !== b.nasc) return [a.nasc < b.nasc ? -1 : 1, '1º critério: mais velho entre os com 60 anos ou mais (item 7.1.1.1)'];
-          if (a.permPub !== b.permPub) return [a.permPub ? -1 : 1, '2º critério: quadro permanente da rede pública (item 7.1.1.2)'];
-          if (a.nasc && b.nasc && a.nasc !== b.nasc) return [a.nasc < b.nasc ? -1 : 1, '3º critério: data de nascimento mais antiga (item 7.1.1.3)'];
-          if (!!a.nasc !== !!b.nasc) return [a.nasc ? -1 : 1, 'data de nascimento ausente na lista: conferir'];
-          return [0, 'empate não resolvido pelos critérios do edital: conferir'];
+          if (a.idoso !== b.idoso) return [a.idoso ? -1 : 1, `1º critério: 60 anos ou mais (item ${it.c1})`];
+          if (a.idoso && b.idoso && a.nasc !== b.nasc) return [a.nasc < b.nasc ? -1 : 1, `1º critério: mais velho entre os com 60 anos ou mais (item ${it.c1})`];
+          if (a.permPub !== b.permPub) return [a.permPub ? -1 : 1, `2º critério: quadro permanente da rede pública (item ${it.c2})`];
+          let nota = '';
+          if (it.c3) {
+            if (a.tempo != null && b.tempo != null && a.tempo !== b.tempo) return [a.tempo > b.tempo ? -1 : 1, `3º critério: maior tempo de docência na rede pública (item ${it.c3})`];
+            if ((a.tempo == null) !== (b.tempo == null) || (a.tempo == null && b.tempo == null)) nota = ' (tempo de docência na rede pública não informado: conferir)';
+          }
+          const nIdade = it.c3 ? '4º' : '3º';
+          if (a.nasc && b.nasc && a.nasc !== b.nasc) return [a.nasc < b.nasc ? -1 : 1, `${nIdade} critério: data de nascimento mais antiga (item ${it.cIdade})` + nota];
+          if (!!a.nasc !== !!b.nasc) return [a.nasc ? -1 : 1, 'data de nascimento ausente na lista: conferir' + nota];
+          return [0, 'empate não resolvido pelos critérios do edital: conferir' + nota];
         };
         const byName = (a, b) => (a.c.name || '').localeCompare(b.c.name || '', 'pt-BR', { sensitivity: 'base' });
         const sortRank = arr => arr.sort((a, b) => cmpCrit(a, b)[0] || byName(a, b));
         const live = items.filter(x => !x.c.aus && !x.c.eli);
-        const pub = sortRank(live.filter(x => x.aprov && x.rede === 'Pública'));
-        const priv = sortRank(live.filter(x => x.aprov && x.rede === 'Privada'));
-        const semRede = sortRank(live.filter(x => x.aprov && !x.rede));
         const reprov = sortRank(live.filter(x => !x.aprov));
         const elim = sortRank(items.filter(x => x.c.eli && !x.c.aus)), aus = items.filter(x => x.c.aus).sort(byName);
         const V = Number.isInteger(vagas) ? vagas : Infinity;
@@ -4267,6 +4364,18 @@
           x.pos = posFrom ? i + 1 : '';
           x.why = prev && prev.sc === x.sc ? cmpCrit(prev, x)[1] : tied > 1 ? `empate na nota entre ${tied} candidatos` : '';
         });
+        if (isSnad()) {
+          // Etapa 1 do SNAD: todos os habilitados numa ordem só; vão para a Etapa 2 até 5 × vagas, com os empates na nota de corte
+          const hab = sortRank(live.filter(x => x.aprov)), L = 5 * V;
+          const corte = hab.length > L ? hab[L - 1].sc : -Infinity;
+          mark(hab, i => hab[i].sc >= corte ? 'E2' : 'HB', true);
+          mark(reprov, 'RP', false); mark(elim, 'EL', false); mark(aus, 'AU', false);
+          for (const x of aus) x.why = '';
+          return { order: [...hab, ...reprov, ...elim, ...aus], vagas: Number.isInteger(vagas) ? vagas : null, corte: Number.isFinite(corte) ? corte : null };
+        }
+        const pub = sortRank(live.filter(x => x.aprov && x.rede === 'Pública'));
+        const priv = sortRank(live.filter(x => x.aprov && x.rede === 'Privada'));
+        const semRede = sortRank(live.filter(x => x.aprov && !x.rede));
         mark(pub, i => i < V ? 'L1' : 'L2', true);
         mark(priv, 'L3', true);
         mark(semRede, 'SR', false); mark(reprov, 'RP', false); mark(elim, 'EL', false); mark(aus, 'AU', false);
@@ -4277,17 +4386,21 @@
       /* Com a lista de inscritos: aba Resultados já ordenada, com CPF mascarado (item 6.5), data de nascimento,
          rede e quadro permanente. A nota é o número de acertos. */
       function buildRosterResultRows() {
-        const head = ['Lista', 'Posição', 'Nome', 'CPF mascarado', 'CPF', 'Nascimento', 'Rede', 'Quadro permanente', 'Raça/cor', 'Gênero',
-          'Nota', 'Situação', 'Revisão', 'Desempate (em relação ao anterior)', 'Alertas', 'Lista de inscritos']
+        const snad = isSnad();
+        const head = [grpHead(), 'Posição', 'Nome', 'CPF mascarado', 'CPF', 'Nascimento', 'Rede', 'Quadro permanente']
+          .concat(snad ? ['Tempo de docência na rede pública (anos)'] : [])
+          .concat(['Raça/cor', 'Gênero', 'Nota', 'Situação', 'Revisão', 'Desempate (em relação ao anterior)', 'Alertas', 'Lista de inscritos'])
           .concat(Array.from({ length: NQ }, (_, i) => 'Q' + (i + 1)));
         const { order } = rankCards(ROSTER.vagas), rows = [head];
         const row = x => {
           const c = x.c;
-          return [LISTA_TXT[x.grp] || '', x.pos, c.name || '', maskCpf(c.cpf), c.cpf || '', fmtBirth(x.nasc), x.rede, x.perm, x.raca, x.genero,
+          return [grpTxt(x.grp), x.pos, c.name || '', maskCpf(c.cpf), c.cpf || '', fmtBirth(x.nasc), x.rede, x.perm]
+            .concat(snad ? [x.tempo == null ? '' : x.tempo] : [])
+            .concat([x.raca, x.genero,
             c.aus ? '' : Math.round(x.sc / NQ * S.cfg.max * 100) / 100,
             c.aus ? 'Ausente' : c.eli ? 'Eliminado' : 'Presente',
             c.rev ? 'Revisado' : (alertsOf(c).length ? 'Pendente' : 'Sem alertas'),
-            x.why || '', alertsOf(c).join(' | '), c.roster ? ROSTER_TXT[c.roster.status] || '' : '']
+            x.why || '', alertsOf(c).join(' | '), c.roster ? ROSTER_TXT[c.roster.status] || '' : ''])
             .concat(c.ans.map((a, q) => qCell(c, q)));
         };
         for (const x of order) rows.push(row(x));
@@ -4301,11 +4414,11 @@
         for (const x of order) {
           if (x.c.aus) continue;
           const ch = chosen.get(cpfDigits(x.c.cpf));
-          if (ch && !used.has(ch.row)) { lead.push(ch.row); info.set(ch.row, { lista: LISTA_TXT[x.grp] || '', pos: x.pos }); used.add(ch.row); }
+          if (ch && !used.has(ch.row)) { lead.push(ch.row); info.set(ch.row, { lista: grpTxt(x.grp), pos: x.pos }); used.add(ch.row); }
         }
         return { lead, info };
       }
-      function addResultsSheetToXlsx(bytes, rows, colWidths = ROSTER.list ? RESULT_COL_WIDTHS : [38, 17, 10, 10, 13, 14, 42, 26]) {
+      function addResultsSheetToXlsx(bytes, rows, colWidths = ROSTER.list ? resultColWidths() : [38, 17, 10, 10, 13, 14, 42, 26]) {
         const zip = XLSX.CFB.read(new Uint8Array(bytes), { type: 'array' });
         const part = path => {
           const e = XLSX.CFB.find(zip, path);
@@ -4405,7 +4518,7 @@
             // Planilhas .xls e arquivos .csv são convertidos para .xlsx.
             const sourceHeader = ws[XLSX.utils.encode_cell({ r: hr, c: range.e.c })];
             const hc2 = XLSX.utils.encode_cell({ r: hr, c: nextCol + 1 }), hc3 = XLSX.utils.encode_cell({ r: hr, c: nextCol + 2 });
-            ws[hc] = { t: 's', v: 'Nota' }; ws[hc2] = { t: 's', v: 'Lista' }; ws[hc3] = { t: 's', v: 'Posição' };
+            ws[hc] = { t: 's', v: 'Nota' }; ws[hc2] = { t: 's', v: grpHead() }; ws[hc3] = { t: 's', v: 'Posição' };
             if (sourceHeader && sourceHeader.s != null) { ws[hc].s = sourceHeader.s; ws[hc2].s = sourceHeader.s; ws[hc3].s = sourceHeader.s; }
             const ord = rosterSheetOrder(chosen);
             for (const { row, note } of chosen.values()) {
@@ -4426,7 +4539,7 @@
             ws['!cols'][nextCol] = { wch: 10 }; ws['!cols'][nextCol + 1] = { wch: 38 }; ws['!cols'][nextCol + 2] = { wch: 10 };
             const resultRows = buildResultRows();
             const resultWs = XLSX.utils.aoa_to_sheet(resultRows);
-            resultWs['!cols'] = RESULT_COL_WIDTHS.map(w => ({ wch: w })).concat(Array(NQ).fill({ wch: 12 }));
+            resultWs['!cols'] = resultColWidths().map(w => ({ wch: w })).concat(Array(NQ).fill({ wch: 12 }));
             let resultSheetName = 'Resultados', seq = 2;
             while (wb.SheetNames.some(n => n.toLocaleLowerCase() === resultSheetName.toLocaleLowerCase()))
               resultSheetName = `Resultados (${seq++})`;
@@ -4997,9 +5110,9 @@
             const st = {}; for (const c of S.cards) { applyRoster(c); saveCard(c); st[c.roster.status] = (st[c.roster.status] || 0) + 1; }
             renderList();
             const resumo = S.cards.length ? `<br><br>Cartões já carregados: ${st.exato || 0} conferem${st.corrigido ? `, ${st.corrigido} com CPF corrigido` : ''}${st['nome-difere'] ? `, ${st['nome-difere']} com nome diferente` : ''}${st['por-nome'] ? `, ${st['por-nome']} identificados pelo nome` : ''}${st.ambiguo ? `, ${st.ambiguo} ambíguos` : ''}${st['nao-encontrado'] ? `, ${st['nao-encontrado']} fora da lista` : ''}.` : '<br><br>Os próximos PDFs carregados serão conferidos com ela.';
-            const xc = r.extraCols || {}, achou = [xc.nasc >= 0 && 'data de nascimento', (xc.rede >= 0 || xc.redePub >= 0 || xc.redePriv >= 0) && 'rede (pública/privada)', (xc.perm >= 0 || (xc.rede >= 0 && r.list.some(e => e.perm))) && 'quadro permanente'].filter(Boolean);
-            const faltou = ['data de nascimento', 'rede (pública/privada)', 'quadro permanente'].filter(x => !achou.includes(x));
-            const extra = `<br><br>Dados para o desempate (edital, item 7.1.1): ${achou.length ? 'encontrei ' + achou.join(', ') : 'nenhum encontrado'}.${faltou.length ? ` Sem ${faltou.join(', ')}, esse critério fica em branco na aba Resultados.` : ''}`;
+            const xc = r.extraCols || {}, achou = [xc.nasc >= 0 && 'data de nascimento', (xc.rede >= 0 || xc.redePub >= 0 || xc.redePriv >= 0) && 'rede (pública/privada)', (xc.perm >= 0 || (xc.rede >= 0 && r.list.some(e => e.perm))) && 'quadro permanente', isSnad() && xc.tempo >= 0 && 'tempo de docência na rede pública'].filter(Boolean);
+            const faltou = ['data de nascimento', 'rede (pública/privada)', 'quadro permanente'].concat(isSnad() ? ['tempo de docência na rede pública'] : []).filter(x => !achou.includes(x));
+            const extra = `<br><br>Dados para o desempate (${EXAM.edital}, item ${EXAM.it.crit}): ${achou.length ? 'encontrei ' + achou.join(', ') : 'nenhum encontrado'}.${faltou.length ? ` Sem ${faltou.join(', ')}, esse critério fica em branco na aba Resultados.` : ''}`;
             await ask(`<b>Lista de inscritos carregada</b><br>${r.list.length} inscritos lidos de ${esc(r.file)}${r.bad.length ? ` (${r.bad.length} linha(s) ignorada(s) por CPF ou nome inválido)` : ''}.${resumo}${extra}`, 'Ok', false, '');
           } catch (err) { await ask(`<b>Não foi possível ler a lista</b><br>${esc(err.message)}<br>Use uma planilha com uma coluna "Nome" e uma coluna "CPF".`, 'Ok', false, ''); }
         }
@@ -5017,12 +5130,14 @@
 
       /* ================= início ================= */
       (async function init() {
+        try { EXAM = EXAMS[examKindOf(await fetchJSON(CONFIG_URL))] || EXAMS.ENA; } catch (e) { EXAM = EXAMS.ENA; }
+        applyCardModel(EXAM.model);
         try { await DB.open(); } catch (e) { console.warn(e); S.memOnly = true; }
         if (!S.memOnly) {
           try {
             const kv = await DB.all('kv');
             for (const r of kv) { if (r.k === 'gab' && r.v && r.v.g && r.v.g.length === NQ) { S.gab = r.v.g; S.gabFrom = r.v.from || S.gabFrom; } if (r.k === 'cfg' && r.v) Object.assign(S.cfg, r.v); if (r.k === 'avisoScan') S.avisoScan = r.v; if (r.k === 'roster' && r.v && r.v.list) setRoster(r.v); if (r.k === 'avisoUso') S.avisoUso = r.v; }
-            S.cfg.model = '2027';   // modelo único: letras dentro dos balões
+            S.cfg.model = EXAM.model;   // ENA 2027 ou SNAD 2027, conforme o config.json
             applyCardModel(S.cfg.model);
             S.cards = (await DB.all('cards')).sort((a, b) => a.t - b.t);
             // A votação entre OCRs foi removida: qualquer escolha antiga (consenso, PP-OCR, PARSeq) vira Tesseract.
@@ -5037,11 +5152,12 @@
               await DB.put('kv', { k: 'uiEna2027', v: 1 });
             }
             await loadServerConfig();   // config.json e gabarito.json prevalecem sobre o que estava gravado
+            if (isSnad() && (!S.cfg.exam || /^ENA/i.test(S.cfg.exam))) S.cfg.exam = EXAM.name;
           } catch (e) { console.warn(e); S.memOnly = true; }
           try { if (navigator.storage && navigator.storage.persist) S.persist = await navigator.storage.persist(); } catch (e) { }
         }
         try { const w = document.getElementById('pdfw'); if (w && window.pdfjsLib) pdfjsLib.GlobalWorkerOptions.workerSrc = URL.createObjectURL(new Blob([w.textContent], { type: 'text/javascript' })); } catch (e) { console.warn(e); }
-        if (S.memOnly) await loadServerConfig();
+        if (S.memOnly) { await loadServerConfig(); if (isSnad() && (!S.cfg.exam || /^ENA/i.test(S.cfg.exam))) S.cfg.exam = EXAM.name; }
         window.__app = { S, DB, STORE };
         renderHeader(); renderList();
         if (apiOn()) { const n = await pullFromServer(); if (n) { renderList(); toast(`${n} cartão(ões) carregado(s) do servidor`); } syncAll(); setInterval(() => syncAll(), 60000); }
