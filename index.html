@@ -733,6 +733,35 @@
         display: block !important;
         border-right: 1px solid var(--line)
       }
+
+      /* cartão inteiro à esquerda: a coluna tem a largura do cartão na altura disponível (ajustada em fitImgPane) */
+      .rv {
+        grid-template-columns: var(--imgw, 50%) minmax(0, 1fr)
+      }
+
+      .rv .imgpane {
+        display: flex !important;
+        flex-direction: column;
+        height: 100%;
+        box-sizing: border-box;
+        overflow: hidden
+      }
+
+      .rv .imgpane button {
+        flex: 1;
+        min-height: 0;
+        display: flex;
+        justify-content: center;
+        align-items: flex-start
+      }
+
+      .rv .imgpane img {
+        width: auto;
+        height: auto;
+        max-width: 100%;
+        max-height: 100%;
+        object-fit: contain
+      }
     }
 
     .imgpane {
@@ -4844,8 +4873,18 @@
             `<button class="btn dng" data-sh="del">Excluir</button><button class="btn pri" data-sh="okrev">${c.rev ? 'Revisado ✓' : 'Marcar revisado'}</button>`}</div>`;
         $('#fName').oninput = e => { c.idManual = true; c.name = e.target.value.toUpperCase(); c.nameLow = false; if (ROSTER.list) applyRoster(c); e.target.value = c.name; saveSoon(c); refreshMeta(c); };
         $('#fCpf').oninput = e => { c.idManual = true; c.cpfLow = false; c.cpf = fmtCpf(e.target.value); if (ROSTER.list) applyRoster(c); e.target.value = c.cpf; saveSoon(c); refreshMeta(c); };
-        refreshMeta(c); applyOnly(); pvSoon(c);
+        refreshMeta(c); applyOnly(); pvSoon(c); fitImgPane();
       }
+      /* largura da coluna do cartão = altura disponível × proporção do cartão (A4), limitada a 62% da tela,
+         para o cartão aparecer inteiro, sem rolagem, ao lado da revisão */
+      function fitImgPane() {
+        const rv = $('#sheet .rv'), pane = $('#imgpane'); if (!rv || !pane) return;
+        if (window.innerWidth < 900) { rv.style.removeProperty('--imgw'); return; }
+        const note = pane.querySelector('.note'), nh = note ? note.offsetHeight + 6 : 0;
+        const h = rv.clientHeight - 20 - nh - 2, w = Math.round(h * CW / CH) + 22;
+        rv.style.setProperty('--imgw', Math.max(320, Math.min(w, Math.round(window.innerWidth * 0.62))) + 'px');
+      }
+      window.addEventListener('resize', () => { if (S.openId) fitImgPane(); });
       function refreshMeta(c) {
         const s = cardScore(c);
         $('#scBig').textContent = c.aus ? '–' : s; $('#scSub').textContent = c.aus ? 'ausente' : `de ${NQ} · nota ${fmtNum(s / NQ * S.cfg.max)}`;
