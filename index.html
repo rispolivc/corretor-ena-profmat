@@ -734,10 +734,15 @@
         border-right: 1px solid var(--line)
       }
 
-      /* cartão inteiro à esquerda: a coluna tem a largura do cartão na altura disponível (ajustada em fitImgPane) */
+      /* cartão inteiro à esquerda: a coluna tem a largura do cartão na altura disponível (ajustada em fitImgPane).
+         Entre 900 e 1199 px: à direita, identificação em cima e respostas embaixo (com rolagem). */
       .rv {
         grid-template-columns: var(--imgw, 50%) minmax(0, 1fr)
       }
+
+      .rv .rcol { overflow: auto; min-height: 0 }
+      .rv .idpane { padding-bottom: 4px }
+      .rv .qpane { padding-top: 4px }
 
       .rv .imgpane {
         display: flex !important;
@@ -791,6 +796,87 @@
 
     .pane {
       padding: 12px 14px 24px
+    }
+
+    .qhead {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 8px;
+      margin: 0 0 6px
+    }
+
+    .qhead h2 {
+      margin: 0;
+      flex: 1 0 100%
+    }
+
+    .qnote {
+      margin: 0 0 8px
+    }
+
+    /* respostas compactas numa coluna só (1 a 30), a partir de 900 px */
+    @media(min-width:900px) {
+      #qlist .qcol { display: contents }
+
+
+      #qlist .qrow { padding: 2px 0; margin: 0 }
+      #qlist .qrow.fl { margin: 0 -6px; padding: 3px 6px; border-radius: 6px }
+      #qlist .qr { gap: 3px; padding: 0 }
+      #qlist .qn { width: 22px; font-size: 13px }
+      #qlist .chip { min-width: 28px; min-height: 24px; max-width: 40px; border-radius: 6px; font-size: 12.5px; padding: 0 2px }
+      #qlist .chip.an, #qlist [data-comm] { max-width: 48px; font-size: 11px }
+      #qlist .qrow .lab.mut { display: none }
+      #qlist .qrow .qr { flex-wrap: nowrap }
+      /* botões com passo fixo (40 + 3 px), na mesma escala do recorte: passo das bolhas no cartão = 76,75 px
+         -> 43 px na tela. Assim o número e as bolhas do recorte ficam sobre o número e os botões da linha. */
+      #qlist .qn { width: 22px; text-align: center }
+      #qlist .qr .chip { flex: none; width: 40px; min-width: 40px; max-width: 40px }
+      #qlist .qr .qn + .chip { margin-left: 8px }
+      #qlist .qrow .lab { flex: 1 1 auto; margin: 0 0 0 6px; font-size: 11.5px; line-height: 1.15; text-align: right; white-space: nowrap }
+      /* recorte do cartão na mesma escala dos botões (altura de uma linha), alinhado com as alternativas */
+      #qlist .crop.question-crop { width: 283px; height: auto; max-width: none; margin: 0 0 1px 0 }
+
+    }
+
+    /* Revisão em telas largas: 3 colunas (cartão | respostas | identificação), tudo visível sem rolagem.
+       As 30 respostas ficam numa coluna só, com botões compactos.
+       A rolagem só aparece quando há questões com alerta (recorte do cartão na linha). */
+    @media(min-width:1200px) {
+      .rv {
+        grid-template-columns: var(--imgw, 36%) minmax(330px, 400px) minmax(300px, 1fr)
+      }
+
+      /* as 30 linhas dividem a altura da coluna (até ~30 px cada); linhas com alerta usam a altura que precisam.
+         Só quando não cabe (várias linhas com alerta) a coluna rola. */
+      .rv .qpane { display: flex; flex-direction: column }
+      .rv #qlist { flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column }
+      .rv #qlist .qrow { flex: 1 1 0; min-height: 18px; max-height: 34px; display: flex; flex-direction: column; justify-content: center; padding: 1px 0 }
+      .rv #qlist .qrow.fl { flex: none; max-height: none; padding: 3px 6px }
+      .rv #qlist .qrow .qr { flex: 1 1 auto; min-height: 0; max-height: 30px }
+      .rv #qlist .qrow.fl .qr { flex: none; max-height: none }
+      .rv #qlist .chip { min-height: 16px; height: 100%; max-height: 28px; max-width: 46px }
+      .rv #qlist .qrow.fl .chip { height: 26px }
+      .rv #qlist .qrow.fl .lab { margin-bottom: 0 }
+      .rv .qhead { flex-wrap: nowrap; gap: 6px }
+      .rv .qhead h2 { font-size: 15px }
+      .rv .qhead .btn, .rv .qhead .fchip { white-space: nowrap; padding: 4px 8px; font-size: 12.5px }
+
+      .rv .rcol { display: contents }
+      .rv .qpane { grid-column: 2; grid-row: 1; overflow: auto; min-height: 0; padding: 10px 12px 12px }
+      .rv .idpane { grid-column: 3; grid-row: 1; overflow: auto; min-height: 0; border-left: 1px solid var(--line); padding-top: 10px }
+      .rv .qhead h2 { flex: 0 0 auto; margin-right: 4px }
+      .rv .qhead .btn { min-height: 30px; padding: 4px 10px; font-size: 13px }
+      .rv .qhead .fchip { min-height: 30px; padding: 4px 10px; font-size: 13px }
+      .rv .qnote { display: none }
+
+      .rv .idpane .strip2 { flex-direction: column; gap: 2px !important }
+      .rv .idpane .strip2 .crop:first-child { width: 100% !important; flex: none !important }
+      .rv .idpane .strip2 .crop:last-child { width: var(--cpfw, 50%) !important; flex: none !important }
+      .rv .idpane .big b { font-size: 38px }
+      .rv .idpane .tog .btn { min-height: 34px; padding: 4px 10px; font-size: 14px }
+      .rv .idpane .fld { margin-bottom: 8px }
+      .rv .idpane input.txt { padding-top: 7px; padding-bottom: 7px }
     }
 
     .fld {
@@ -3775,9 +3861,9 @@
         const a = [];
         const d = c.ans.map((_, i) => isDouble(c, i) && S.gab[i] !== 5 ? i + 1 : 0).filter(Boolean);
         const w = c.st.map((s, i) => s === 'weak' ? i + 1 : 0).filter(Boolean);
-        if (d.length) a.push('Dupla marcação — questão zerada: ' + d.map(n => 'Q' + n).join(', '));
+        if (d.length) a.push('Dupla marcação: ' + d.map(n => 'Q' + n).join(', '));
         const cz = c.ans.map((_, i) => isComm(c, i) && S.gab[i] !== 5 ? i + 1 : 0).filter(Boolean);
-        if (cz.length) a.push('Campo cinza da comissão marcado — questão anulada para o candidato: ' + cz.map(n => 'Q' + n).join(', '));
+        if (cz.length) a.push('Campo cinza marcado: ' + cz.map(n => 'Q' + n).join(', '));
         if (w.length) a.push('Marcação fraca ou traço suspeito: ' + w.map(n => 'Q' + n).join(', '));
         if (!c.name) a.push('Sem nome');
         else if (c.nameSrc === 'ocr' && c.nameLow) a.push('Nome lido por OCR com dúvida: confira');
@@ -4816,7 +4902,10 @@
       /* ---------- revisão ---------- */
       function rowHtml(c, q) {
         const st = c.st[q], a = c.ans[q], g = S.gab[q], double = isDouble(c, q), comm = isComm(c, q), fl = double || st === 'weak' || comm || !!(c.commMan && c.commMan[q]);
-        const lab = comm ? (g === 5 ? 'campo cinza da comissão marcado — questão anulada no gabarito (ponto concedido)' : 'campo cinza da comissão marcado — anulada para o candidato (0)') : double ? (g === 5 ? 'dupla marcação — questão anulada (ponto concedido)' : 'dupla marcação — zerada (0)') : st === 'weak' ? 'marcação fraca / traço suspeito' : st === 'blank' ? 'em branco' : (c.man[q] ? 'ajustada' : '');
+        // texto curto na linha; a explicação completa fica na dica (title)
+        const lab = comm ? 'campo cinza' : double ? 'dupla marcação' : st === 'weak' ? 'marcação fraca' : st === 'blank' ? 'em branco' : (c.man[q] ? 'ajustada' : '');
+        const labTip = comm ? (g === 5 ? 'Campo cinza da comissão marcado; questão anulada no gabarito: ponto concedido' : 'Campo cinza da comissão marcado: questão anulada para o candidato (vale 0)')
+          : double ? (g === 5 ? 'Dupla marcação; questão anulada no gabarito: ponto concedido' : 'Dupla marcação: a questão vale 0') : st === 'weak' ? 'Marcação fraca ou traço suspeito: confira' : '';
         const chips = [0, 1, 2, 3, 4].map(k => {
           let cl = 'chip';
           if (double) { if (markedAlternative(c, q, k)) cl += ' dbl'; }
@@ -4825,10 +4914,11 @@
           return `<button class="${cl}" data-set="${q},${k}" aria-label="Questão ${q + 1} alternativa ${LET[k]}">${LET[k]}</button>`;
         }).join('') + ((comm || (c.commMan && c.commMan[q]))
           ? `<button class="chip${comm ? ' dbl' : ''}" data-comm="${q}" title="Campo cinza da comissão: clique para ${comm ? 'desconsiderar' : 'considerar'} a marca" aria-label="Questão ${q + 1}: campo cinza ${comm ? 'marcado' : 'desconsiderado'}">cinza</button>` : '');
-        const off = c.offs ? c.offs[q] : [0, 0], t = TPL[q], cropX = t.x - 12 + off[0], cropW = 530, cropY = t.y - 8 + off[1], cropH = 41;
+        // recorte: do quadrado numerado até o campo cinza (alinhado com o número e os botões da linha de revisão)
+        const off = c.offs ? c.offs[q] : [0, 0], t = TPL[q], cropX = t.x + 6 + off[0], cropW = 505, cropY = t.y - 8 + off[1], cropH = 41;
         const px = Math.max(0, Math.min(1, cropX / (CW - cropW))) * 100, py = Math.max(0, Math.min(1, cropY / (CH - cropH))) * 100;
         const crop = fl ? `<div class="crop question-crop" style="aspect-ratio:${cropW}/${cropH};background-image:url(${urlOf(c, 'img')});background-size:${CW / cropW * 100}% auto;background-position:${px}% ${py}%"></div>` : '';
-        return `<div class="qrow ${fl ? 'fl' : ''}" id="q${q}">${crop}<div class="qr" style="border:0;padding:0"><span class="qn">${q + 1}</span>${chips}<span class="lab ${fl ? '' : 'mut'}">${lab}</span></div></div>`;
+        return `<div class="qrow ${fl ? 'fl' : ''}" id="q${q}">${crop}<div class="qr" style="border:0;padding:0"><span class="qn">${q + 1}</span>${chips}<span class="lab ${fl ? '' : 'mut'}"${labTip ? ` title="${labTip}"` : ''}>${lab}</span></div></div>`;
       }
       function openSheet(id, opts) {
         opts = opts || {};
@@ -4843,17 +4933,17 @@
       function stripHtml(c) {
         // nome e CPF lado a lado, na mesma escala: a largura de cada um é proporcional ao trecho recortado do cartão
         const n = CARD.strip.name, p = CARD.strip.cpf;
-        return `<div class="fld"><label>Como está impresso no cartão</label><div style="display:flex;gap:6px;align-items:flex-start;max-width:760px">
+        return `<div class="fld"><label>Como está impresso no cartão</label><div class="strip2" style="display:flex;gap:6px;align-items:flex-start;max-width:760px;--cpfw:${Math.round(p[2] / n[2] * 100)}%">
     <div class="crop" style="${cropStyle(c, ...n)};flex:${n[2]} 1 0;width:auto;min-width:0;max-width:none;margin:2px 0 6px"></div>
     <div class="crop" style="${cropStyle(c, ...p)};flex:${p[2]} 1 0;width:auto;min-width:0;max-width:none;margin:2px 0 6px"></div></div></div>`;
       }
       function drawSheet(c) {
         const sh = $('#sheet'), ids = (S.sheetOpts && S.sheetOpts.fresh) ? [] : visibleCards().map(x => x.id), pos = ids.indexOf(c.id);
-        const al = alertsOf(c), dp = dupOf(c);
+        const al = alertsOf(c), dp = dupOf(c); S.onlyAlerts = false;
         const fromCam = S.sheetOpts && S.sheetOpts.cam;
         sh.innerHTML = `<div class="ovbar"><button class="btn" data-sh="close">${S.sheetOpts && S.sheetOpts.cam ? '‹ Câmera' : '‹ Lista'}</button><span class="ttl">${esc(c.name || 'Sem nome')}</span>
     ${ids.length ? `<button class="btn" data-sh="prev" ${pos <= 0 ? 'disabled' : ''} aria-label="Anterior">‹</button><button class="btn" data-sh="next" ${pos < 0 || pos >= ids.length - 1 ? 'disabled' : ''} aria-label="Próximo">›</button>` : ''}</div>
-  <div class="ovbody"><div class="rv"><div class="imgpane" id="imgpane"><button data-sh="zoom" aria-label="Ampliar o cartão"><img id="pvimg" alt="Cartão anotado"></button><div class="note">Clique na imagem para ampliar.</div></div><div class="pane">
+  <div class="ovbody"><div class="rv"><div class="imgpane" id="imgpane"><button data-sh="zoom" aria-label="Ampliar o cartão"><img id="pvimg" alt="Cartão anotado"></button><div class="note">Clique na imagem para ampliar.</div></div><div class="rcol"><div class="pane idpane">
     <div class="big"><b id="scBig"></b><span id="scSub"></span></div>
     <div class="row" style="margin-bottom:8px"><button class="btn" data-sh="view">Ver cartão anotado</button></div>
     <div id="alerts"></div>
@@ -4863,12 +4953,11 @@
     <div class="fld"><label for="fName">Nome${c.nameSrc === 'ocr' ? ' (lido automaticamente)' : ''}</label><input class="txt" id="fName" autocomplete="off" autocapitalize="characters" value="${esc(c.name)}"></div>
     <div class="fld"><label for="fCpf">CPF</label><input class="txt" id="fCpf" inputmode="numeric" autocomplete="off" value="${esc(fmtCpf(c.cpf))}"><div class="cpfmsg" id="cpfMsg"></div></div>
     <div class="tog"><button class="btn ${c.aus ? 'on' : ''}" data-sh="aus">Ausente</button><button class="btn ${c.eli ? 'on' : ''}" data-sh="eli">Eliminado</button></div>
-    <h2>Respostas</h2>
-    <div class="row"><button class="btn" data-sh="marks">Reler marcações e situação</button></div>
-    <div class="note" style="margin:6px 0 10px">Atualiza a leitura da foto salva e mantém respostas ajustadas manualmente.</div>
-    <div class="row"><button class="fchip ${S.onlyAlerts ? 'on' : ''}" data-sh="only">${S.onlyAlerts ? 'Mostrando só alertas' : 'Mostrar só alertas'}</button></div>
-    <div id="qlist">${Array.from({ length: NQ }, (_, q) => rowHtml(c, q)).join('')}</div>
-  </div></div></div>
+  </div>
+  <div class="pane qpane">
+    <div class="qhead"><h2>Respostas</h2></div>
+    <div id="qlist"><div class="qcol">${Array.from({ length: 15 }, (_, q) => rowHtml(c, q)).join('')}</div><div class="qcol">${Array.from({ length: NQ - 15 }, (_, q) => rowHtml(c, q + 15)).join('')}</div></div>
+  </div></div></div></div>
   <div class="ovfoot">${fromCam ? `<button class="btn" data-sh="del">Descartar</button><button class="btn pri" data-sh="camnext">Salvar e próximo cartão</button>` :
             `<button class="btn dng" data-sh="del">Excluir</button><button class="btn pri" data-sh="okrev">${c.rev ? 'Revisado ✓' : 'Marcar revisado'}</button>`}</div>`;
         $('#fName').oninput = e => { c.idManual = true; c.name = e.target.value.toUpperCase(); c.nameLow = false; if (ROSTER.list) applyRoster(c); e.target.value = c.name; saveSoon(c); refreshMeta(c); };
