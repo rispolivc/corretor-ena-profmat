@@ -1890,49 +1890,71 @@
                (fitRS) é ajustado direto na página original, para que o resultado final seja rígido.
          H0:   alinhamento já conhecido na imagem de análise (2ª passagem): sem votação, raios pequenos.
          Retorna M (canônico -> página original) e R (canônico -> imagem de análise). */
+      /* Impressão clara: em alguns lotes os quadrados numerados saem em cinza-claro de retícula (pontos, ~170 no
+         meio) e não passam no limiar normal. Se a busca normal não fecha o cartão, a busca é refeita sobre a imagem
+         suavizada (a retícula vira um cinza uniforme) com um limiar mais tolerante. Lotes com impressão normal
+         resolvem na primeira busca e não passam pela segunda. */
       function findMarkers(gray, w, h, s, H0, Hpre) {
+        const r1 = findMarkersCore(gray, w, h, s, H0, Hpre, false);
+        if (r1 && r1.R && r1.inliers >= 22) return r1;
+        const r2 = findMarkersCore(gray, w, h, s, H0, Hpre, true);
+        return (r2 && r2.R && (r2.inliers || 0) > ((r1 && r1.R && r1.inliers) || 0)) ? r2 : r1;
+      }
+      function findMarkersCore(gray, w, h, s, H0, Hpre, lightPrint) {
         const n = w * h, W1 = w + 1;
-        const ii = new Uint32Array(W1 * (h + 1));
-        for (let y = 0; y < h; y++) {
-          let row = 0;
-          for (let x = 0; x < w; x++) { row += gray[y * w + x]; ii[(y + 1) * W1 + x + 1] = ii[y * W1 + x + 1] + row; }
-        }
-        const r = Math.max(4, Math.round(30 * s));
         const y0 = Math.floor(h * 0.35), y1 = Math.floor(h * 0.92);
         const hist = new Uint32Array(256);
         for (let y = y0; y < y1; y++) for (let x = 0; x < w; x++) hist[gray[y * w + x]]++;
         const tot = (y1 - y0) * w; let acc = 0, P = 255;
         for (let i = 255; i >= 0; i--) { acc += hist[i]; if (acc >= tot * 0.10) { P = i; break; } }
         if (P < 90) return { inliers: 0 };
-        const cap = P * 0.68;
-        const mask = new Uint8Array(n);
-        for (let y = y0; y < y1; y++) {
-          const ya = Math.max(0, y - r), yb = Math.min(h, y + r + 1);
-          for (let x = 0; x < w; x++) {
-            const v = gray[y * w + x]; if (v >= cap) continue;
-            const xa = Math.max(0, x - r), xb = Math.min(w, x + r + 1);
-            const area = (xb - xa) * (yb - ya);
-            const sum = ii[yb * W1 + xb] - ii[ya * W1 + xb] - ii[yb * W1 + xa] + ii[ya * W1 + xa];
-            if (v < (sum / area) * 0.8) mask[y * w + x] = 1;
+        /* candidatos a quadrado numerado: manchas escuras do tamanho de um quadrado.
+           capF: o pixel precisa ser mais escuro que capF × papel; locF: e mais escuro que locF × média local. */
+        const detect = (g, capF, locF, minFill = 0.55) => {
+          const ii = new Uint32Array(W1 * (h + 1));
+          for (let y = 0; y < h; y++) {
+            let row = 0;
+            for (let x = 0; x < w; x++) { row += g[y * w + x]; ii[(y + 1) * W1 + x + 1] = ii[y * W1 + x + 1] + row; }
           }
-        }
-        const seen = new Uint8Array(n), stk = new Int32Array(n), cands = [];
-        for (let y = y0; y < y1; y++) for (let x = 0; x < w; x++) {
-          const p = y * w + x; if (!mask[p] || seen[p]) continue;
-          let sp = 0; stk[sp++] = p; seen[p] = 1;
-          let minx = x, maxx = x, miny = y, maxy = y, area = 0;
-          while (sp) {
-            const q = stk[--sp], qy = (q / w) | 0, qx = q - qy * w; area++;
-            if (qx < minx) minx = qx; else if (qx > maxx) maxx = qx;
-            if (qy < miny) miny = qy; else if (qy > maxy) maxy = qy;
-            if (qx > 0) { const m = q - 1; if (mask[m] && !seen[m]) { seen[m] = 1; stk[sp++] = m; } }
-            if (qx < w - 1) { const m = q + 1; if (mask[m] && !seen[m]) { seen[m] = 1; stk[sp++] = m; } }
-            if (qy > 0) { const m = q - w; if (mask[m] && !seen[m]) { seen[m] = 1; stk[sp++] = m; } }
-            if (qy < h - 1) { const m = q + w; if (mask[m] && !seen[m]) { seen[m] = 1; stk[sp++] = m; } }
+          const r = Math.max(4, Math.round(30 * s)), cap = P * capF;
+          const mask = new Uint8Array(n);
+          for (let y = y0; y < y1; y++) {
+            const ya = Math.max(0, y - r), yb = Math.min(h, y + r + 1);
+            for (let x = 0; x < w; x++) {
+              const v = g[y * w + x]; if (v >= cap) continue;
+              const xa = Math.max(0, x - r), xb = Math.min(w, x + r + 1);
+              const area = (xb - xa) * (yb - ya);
+              const sum = ii[yb * W1 + xb] - ii[ya * W1 + xb] - ii[yb * W1 + xa] + ii[ya * W1 + xa];
+              if (v < (sum / area) * locF) mask[y * w + x] = 1;
+            }
           }
-          const bw = maxx - minx + 1, bh = maxy - miny + 1;
-          if (bw >= SQW * s * 0.68 && bw <= SQW * s * 1.4 && bh >= SQH * s * 0.6 && bh <= SQH * s * 1.55 && area / (bw * bh) >= 0.55)
-            cands.push({ X: (minx + bw / 2) / s, Y: (miny + bh / 2) / s });
+          const seen = new Uint8Array(n), stk = new Int32Array(n), out = [];
+          for (let y = y0; y < y1; y++) for (let x = 0; x < w; x++) {
+            const p = y * w + x; if (!mask[p] || seen[p]) continue;
+            let sp = 0; stk[sp++] = p; seen[p] = 1;
+            let minx = x, maxx = x, miny = y, maxy = y, area = 0;
+            while (sp) {
+              const q = stk[--sp], qy = (q / w) | 0, qx = q - qy * w; area++;
+              if (qx < minx) minx = qx; else if (qx > maxx) maxx = qx;
+              if (qy < miny) miny = qy; else if (qy > maxy) maxy = qy;
+              if (qx > 0) { const m = q - 1; if (mask[m] && !seen[m]) { seen[m] = 1; stk[sp++] = m; } }
+              if (qx < w - 1) { const m = q + 1; if (mask[m] && !seen[m]) { seen[m] = 1; stk[sp++] = m; } }
+              if (qy > 0) { const m = q - w; if (mask[m] && !seen[m]) { seen[m] = 1; stk[sp++] = m; } }
+              if (qy < h - 1) { const m = q + w; if (mask[m] && !seen[m]) { seen[m] = 1; stk[sp++] = m; } }
+            }
+            const bw = maxx - minx + 1, bh = maxy - miny + 1;
+            if (bw >= SQW * s * 0.68 && bw <= SQW * s * 1.4 && bh >= SQH * s * 0.6 && bh <= SQH * s * 1.55 && area / (bw * bh) >= minFill)
+              out.push({ X: (minx + bw / 2) / s, Y: (miny + bh / 2) / s });
+          }
+          return out;
+        };
+        let cands = detect(gray, 0.68, 0.8);
+        if (lightPrint) {
+          const rb = Math.max(1, Math.round((3) * s)), sm = new Uint8Array(n), tmp = new Float32Array(n);
+          for (let y = 0; y < h; y++) { let acc2 = 0; const row = y * w; for (let x = -rb; x <= rb; x++) acc2 += gray[row + Math.min(w - 1, Math.max(0, x))]; for (let x = 0; x < w; x++) { tmp[row + x] = acc2 / (2 * rb + 1); acc2 += gray[row + Math.min(w - 1, x + rb + 1)] - gray[row + Math.max(0, x - rb)]; } }
+          for (let x = 0; x < w; x++) { let acc2 = 0; for (let y = -rb; y <= rb; y++) acc2 += tmp[Math.min(h - 1, Math.max(0, y)) * w + x]; for (let y = 0; y < h; y++) { sm[y * w + x] = acc2 / (2 * rb + 1); acc2 += tmp[Math.min(h - 1, y + rb + 1) * w + x] - tmp[Math.max(0, y - rb) * w + x]; } }
+          // une as duas buscas (as marcações escuras já aparecem na primeira; os quadrados claros, na segunda)
+          for (const c of detect(sm, 0.86, 0.9, 0.45)) if (!cands.some(d => Math.abs(d.X - c.X) < 8 && Math.abs(d.Y - c.Y) < 8)) cands.push(c);
         }
         if (cands.length < 8) return { inliers: 0, ncand: cands.length };
         const tc = TPL.map(t => [t.x + t.w / 2, t.y + t.h / 2]);
@@ -1990,7 +2012,7 @@
           return { M: Mc, a, inl: a.inl };
         };
         const hyps = [];
-        const shifts = H0 ? [[0, 0], [-1, -1], [1, 1]] : [[0, 0], [-1, -1], [1, 1], [-2, -2], [2, 2], [-1, 0], [1, 0], [0, -1], [0, 1]];
+        const shifts = [[0, 0], [-1, -1], [1, 1], [-2, -2], [2, 2], [-1, 0], [1, 0], [0, -1], [0, 1]];
         for (const [sL, sR] of shifts) { const e = refine(M, sL, sR); if (e) hyps.push(e); }
         if (!hyps.length) return { inliers: 0, ncand: cands.length };
         // hipóteses iguais (mesmo encaixe final) contam uma vez
@@ -2026,8 +2048,16 @@
           }
           return n ? sum / n / 255 : 0;
         };
+        /* Os próprios quadrados numerados: cinza nas linhas 1 e 15 e papel (ou só texto fino) fora da grade.
+           Em cartões de impressão clara as molduras quase somem, e é esse termo que separa as hipóteses. */
+        const rowSquare = (col, i) => {
+          const t = TPL[col * 15], y0 = t.y + i * (TPL[col * 15 + 1].y - t.y); let sum = 0, n = 0;
+          for (let y = y0 + 4; y <= y0 + t.h - 4; y += 2) for (let x = t.x + 4; x <= t.x + t.w - 4; x += 2) { sum += px(x, y); n++; }
+          return n ? sum / n / 255 : 0;
+        };
         let sc = 0;
-        for (const col of [0, 1]) sc += rowFrame(col, 0) + rowFrame(col, 14) - rowFrame(col, -1) - rowFrame(col, 15);
+        for (const col of [0, 1]) sc += rowFrame(col, 0) + rowFrame(col, 14) - rowFrame(col, -1) - rowFrame(col, 15)
+          + 0.5 * (Math.min(rowSquare(col, 0), rowSquare(col, 14)) - Math.max(rowSquare(col, -1), rowSquare(col, 15)));
         return sc / 4;
       }
 
